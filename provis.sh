@@ -39,11 +39,19 @@ DISCORD_URL="${DISCORD_WEBHOOK:-${DISCORD_WEBHOOK_URL:-}}"
 COMFY_XTRA_USER="${COMFY_XTRA_USER:-admin}"
 COMFY_XTRA_PASSWORD="${COMFY_XTRA_PASSWORD:-}"
 
+# Resolve Python before any helper needs it. Do not assume a system python3
+# exists just because the Vast shared venv exists.
+if [[ -x /venv/main/bin/python ]]; then PYTHON_BIN=/venv/main/bin/python
+elif [[ -x /opt/conda/bin/python ]]; then PYTHON_BIN=/opt/conda/bin/python
+elif command -v python3 >/dev/null 2>&1; then PYTHON_BIN="$(command -v python3)"
+else log "ERROR: no Python environment found"; exit 1
+fi
+
 if [[ -z "$COMFY_XTRA_PASSWORD" ]]; then
   if [[ -s "$PASS_FILE" ]]; then
     COMFY_XTRA_PASSWORD="$(cat "$PASS_FILE")"
   else
-    COMFY_XTRA_PASSWORD="$(python3 - <<'PYPASS'
+    COMFY_XTRA_PASSWORD="$("$PYTHON_BIN" - <<'PYPASS'
 import secrets
 print(secrets.token_urlsafe(18))
 PYPASS
@@ -58,7 +66,7 @@ send_discord(){
   [[ -z "$DISCORD_URL" ]] && return 0
   curl -fsS --connect-timeout 5 --max-time 10 -X POST "$DISCORD_URL" \
     -H 'Content-Type: application/json' \
-    --data "$(python3 - "$title" "$desc" "$color" <<'PYJSON'
+    --data "$("$PYTHON_BIN" - "$title" "$desc" "$color" <<'PYJSON'
 import json,sys,datetime
 print(json.dumps({"embeds":[{"title":sys.argv[1],"description":sys.argv[2],"color":int(sys.argv[3]),"timestamp":datetime.datetime.now(datetime.timezone.utc).isoformat()}]}))
 PYJSON
@@ -66,15 +74,8 @@ PYJSON
 }
 
 log "Starting Comfy-Xtra provisioning"
-send_discord "⚙️ Provisioning Started" "Comfy-Xtra setup started on `$(hostname)`." 3447003
-
-if [[ -x /venv/main/bin/python ]]; then PYTHON_BIN=/venv/main/bin/python
-elif [[ -x /opt/conda/bin/python ]]; then PYTHON_BIN=/opt/conda/bin/python
-elif command -v python3 >/dev/null 2>&1; then PYTHON_BIN="$(command -v python3)"
-else log "ERROR: no Python found"; send_discord "❌ Provisioning Failed" "No Python environment found." 15158332; exit 1
-fi
-
 log "Python: $PYTHON_BIN"
+send_discord "⚙️ Provisioning Started" "Comfy-Xtra setup started on `$(hostname)`." 3447003
 
 # Wait for apt/dpkg locks rather than racing cloud-init.
 if command -v fuser >/dev/null 2>&1; then
@@ -85,8 +86,192 @@ if command -v fuser >/dev/null 2>&1; then
 fi
 
 retry 5 apt-get update -y
-retry 5 apt-get install -y --no-install-recommends aria2 ca-certificates curl jq psmisc openssl
+retry 5 apt-get install -y --no-install-recommends aria2 ca-certificates curl jq psmisc openssl git procps
 retry 5 "$PYTHON_BIN" -m pip install --no-cache-dir -U certifi 'pymongo[srv]' huggingface_hub hf_xet
+
+# ---------------------------------------------------------------------------
+# Safe boot-time ComfyUI updater
+# - Runs once per container boot (/tmp marker)
+# - Sends Discord webhook before and after the update
+# - Updates comfy-cli, ComfyUI core, requirements, and installed custom nodes
+# - Snapshots clean Git repositories first and rolls them back on hard failure
+# - Update failures are non-fatal: the last working checkout is restored and
+#   provisioning continues so an upstream outage cannot brick the instance.
+# ---------------------------------------------------------------------------
+COMFY_DIR="${COMFY_DIR:-/workspace/ComfyUI}"
+COMFY_XTRA_AUTO_UPDATE="${COMFY_XTRA_AUTO_UPDATE:-1}"
+COMFY_XTRA_UPDATE_TIMEOUT="${COMFY_XTRA_UPDATE_TIMEOUT:-1200}"
+UPDATE_MARKER=/tmp/.comfy_xtra_update_done
+UPDATE_SNAPSHOT=/workspace/.comfy_xtra_update_snapshot.json
+UPDATE_LOG=/var/log/comfy-xtra-update.log
+
+git_short_rev(){
+  git -C "$1" rev-parse --short HEAD 2>/dev/null || printf 'unknown'
+}
+
+snapshot_comfy_repos(){
+  "$PYTHON_BIN" - "$COMFY_DIR" "$UPDATE_SNAPSHOT" <<'PYSNAP'
+import json, os, subprocess, sys
+root, out = sys.argv[1], sys.argv[2]
+repos = []
+candidates = [root]
+custom = os.path.join(root, "custom_nodes")
+if os.path.isdir(custom):
+    for name in os.listdir(custom):
+        p = os.path.join(custom, name)
+        if os.path.isdir(os.path.join(p, ".git")):
+            candidates.append(p)
+for path in candidates:
+    if not os.path.isdir(os.path.join(path, ".git")):
+        continue
+    try:
+        sha = subprocess.check_output(["git", "-C", path, "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL).strip()
+        dirty = bool(subprocess.check_output(["git", "-C", path, "status", "--porcelain"], text=True, stderr=subprocess.DEVNULL).strip())
+        repos.append({"path": path, "sha": sha, "dirty": dirty})
+    except Exception:
+        pass
+os.makedirs(os.path.dirname(out), exist_ok=True)
+with open(out, "w", encoding="utf-8") as f:
+    json.dump({"repos": repos}, f, indent=2)
+print(f"snapshotted {len(repos)} git repositories")
+PYSNAP
+}
+
+rollback_comfy_repos(){
+  [[ -s "$UPDATE_SNAPSHOT" ]] || return 0
+  "$PYTHON_BIN" - "$UPDATE_SNAPSHOT" <<'PYROLL'
+import json, os, subprocess, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    data = json.load(f)
+failed = []
+skipped_dirty = []
+for repo in data.get("repos", []):
+    path, sha, dirty = repo.get("path"), repo.get("sha"), repo.get("dirty")
+    if not path or not sha or not os.path.isdir(os.path.join(path, ".git")):
+        continue
+    if dirty:
+        skipped_dirty.append(path)
+        continue
+    try:
+        subprocess.run(["git", "-C", path, "reset", "--hard", sha], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+    except Exception:
+        failed.append(path)
+print(f"rollback complete; skipped_dirty={len(skipped_dirty)} failed={len(failed)}")
+if failed:
+    print("rollback failures:", *failed, sep="\n - ")
+PYROLL
+
+  # Reconcile Python dependencies against the restored checkouts. This is
+  # best-effort because pip has no true transaction/rollback mechanism.
+  if [[ -f "$COMFY_DIR/requirements.txt" ]]; then
+    "$PYTHON_BIN" -m pip install --disable-pip-version-check --no-input -r "$COMFY_DIR/requirements.txt" >>"$UPDATE_LOG" 2>&1 || true
+  fi
+  local manager_cli="$COMFY_DIR/custom_nodes/ComfyUI-Manager/cm-cli.py"
+  if [[ -f "$manager_cli" ]]; then
+    COMFYUI_PATH="$COMFY_DIR" "$PYTHON_BIN" "$manager_cli" restore-dependencies >>"$UPDATE_LOG" 2>&1 || true
+  fi
+}
+
+run_with_update_timeout(){
+  if command -v timeout >/dev/null 2>&1; then
+    timeout --signal=TERM --kill-after=30s "${COMFY_XTRA_UPDATE_TIMEOUT}s" "$@"
+  else
+    "$@"
+  fi
+}
+
+sanity_check_comfy(){
+  [[ -f "$COMFY_DIR/main.py" ]] || return 1
+  "$PYTHON_BIN" -m py_compile "$COMFY_DIR/main.py" || return 1
+  "$PYTHON_BIN" - <<'PYTEST'
+import torch
+print("torch", torch.__version__, "cuda", torch.version.cuda, "available", torch.cuda.is_available())
+PYTEST
+}
+
+auto_update_comfy(){
+  if [[ "$COMFY_XTRA_AUTO_UPDATE" != "1" ]]; then
+    log "ComfyUI auto-update disabled by COMFY_XTRA_AUTO_UPDATE=$COMFY_XTRA_AUTO_UPDATE"
+    return 0
+  fi
+  if [[ -e "$UPDATE_MARKER" ]]; then
+    log "ComfyUI auto-update already attempted this boot; skipping"
+    return 0
+  fi
+  if [[ ! -d "$COMFY_DIR" || ! -f "$COMFY_DIR/main.py" ]]; then
+    log "WARN: ComfyUI not found at $COMFY_DIR; skipping update"
+    printf '%s skipped: ComfyUI missing\n' "$(date -Is)" > "$UPDATE_MARKER"
+    send_discord "⚠️ ComfyUI Update Skipped" "ComfyUI was not found at \`$COMFY_DIR\`; provisioning will continue." 16753920
+    return 0
+  fi
+
+  : > "$UPDATE_LOG"
+  local before_rev after_rev update_rc=0 update_mode="comfy-cli" warnings="no"
+  before_rev="$(git_short_rev "$COMFY_DIR")"
+  log "Starting ComfyUI boot-time update (current=$before_rev)"
+  send_discord "🔄 ComfyUI Update Started" "Updating ComfyUI core, Python requirements and installed custom nodes on \`$(hostname)\`. Current core: \`$before_rev\`." 3447003
+
+  snapshot_comfy_repos >>"$UPDATE_LOG" 2>&1 || true
+  "$PYTHON_BIN" -m pip freeze > /workspace/.comfy_xtra_pip_before_update.txt 2>/dev/null || true
+
+  # Keep the updater itself current. Failure here is not fatal; Manager/git
+  # fallback below can still update the installation.
+  if ! run_with_update_timeout "$PYTHON_BIN" -m pip install --disable-pip-version-check --no-input --no-cache-dir -U comfy-cli >>"$UPDATE_LOG" 2>&1; then
+    log "WARN: comfy-cli upgrade failed; trying fallback updater"
+  fi
+
+  local comfy_cli="$(dirname "$PYTHON_BIN")/comfy"
+  if [[ -x "$comfy_cli" ]]; then
+    if run_with_update_timeout "$comfy_cli" --workspace "$COMFY_DIR" update all --exit-on-fail >>"$UPDATE_LOG" 2>&1; then
+      update_rc=0
+    else
+      update_rc=$?
+    fi
+  else
+    update_mode="manager-fallback"
+    local manager_cli="$COMFY_DIR/custom_nodes/ComfyUI-Manager/cm-cli.py"
+    # Update core first. --ff-only avoids rewriting user history.
+    if [[ -d "$COMFY_DIR/.git" ]]; then
+      run_with_update_timeout git -C "$COMFY_DIR" pull --ff-only >>"$UPDATE_LOG" 2>&1 || update_rc=$?
+    fi
+    if (( update_rc == 0 )) && [[ -f "$COMFY_DIR/requirements.txt" ]]; then
+      run_with_update_timeout "$PYTHON_BIN" -m pip install --disable-pip-version-check --no-input -r "$COMFY_DIR/requirements.txt" >>"$UPDATE_LOG" 2>&1 || update_rc=$?
+    fi
+    if (( update_rc == 0 )) && [[ -f "$manager_cli" ]]; then
+      run_with_update_timeout env COMFYUI_PATH="$COMFY_DIR" "$PYTHON_BIN" "$manager_cli" update all >>"$UPDATE_LOG" 2>&1 || update_rc=$?
+    fi
+  fi
+
+  # comfy-cli/Manager may report individual node errors without a non-zero
+  # exit status. Record this as a warning but only rollback on a hard command
+  # failure or a failed sanity check.
+  if grep -Eiq '(^|[^A-Za-z])(ERROR|FAILED|Traceback)(:|[^A-Za-z])' "$UPDATE_LOG"; then
+    warnings="yes"
+  fi
+
+  if (( update_rc == 0 )) && sanity_check_comfy >>"$UPDATE_LOG" 2>&1; then
+    after_rev="$(git_short_rev "$COMFY_DIR")"
+    printf '%s success before=%s after=%s mode=%s warnings=%s\n' "$(date -Is)" "$before_rev" "$after_rev" "$update_mode" "$warnings" > "$UPDATE_MARKER"
+    log "ComfyUI update completed (before=$before_rev after=$after_rev mode=$update_mode warnings=$warnings)"
+    if [[ "$warnings" == "yes" ]]; then
+      send_discord "⚠️ ComfyUI Update Finished with Warnings" "Update completed and sanity checks passed. Core: \`$before_rev → $after_rev\`. Some custom-node updater warnings were detected; see \`$UPDATE_LOG\`." 16753920
+    else
+      send_discord "✅ ComfyUI Update Finished" "ComfyUI core + installed custom nodes are updated and sanity checks passed. Core: \`$before_rev → $after_rev\`." 5763719
+    fi
+    return 0
+  fi
+
+  local failed_rc="$update_rc"
+  (( failed_rc == 0 )) && failed_rc=1
+  log "WARN: ComfyUI update/sanity check failed rc=$failed_rc; restoring previous clean Git revisions"
+  rollback_comfy_repos >>"$UPDATE_LOG" 2>&1 || true
+  after_rev="$(git_short_rev "$COMFY_DIR")"
+  printf '%s rolled-back before=%s current=%s rc=%s\n' "$(date -Is)" "$before_rev" "$after_rev" "$failed_rc" > "$UPDATE_MARKER"
+  send_discord "🛟 ComfyUI Update Rolled Back" "The boot-time update failed (rc=\`$failed_rc\`). Clean Git repositories were restored to their previous revisions and provisioning will continue. Core now: \`$after_rev\`. See \`$UPDATE_LOG\`." 15105570
+  return 0
+}
+
+auto_update_comfy
 
 COMFY_BASE=/workspace/ComfyUI/models
 for folder in audio_encoders background_removal checkpoints ckpt clip clip_vision configs controlnet detection diffusers diffusion_models embeddings frame_interpolation geometry_estimation gligen hypernetworks latent_upscale_models loras model_patches optical_flow photomaker style_models text_encoders unet upscale_models vae vae_approx; do
