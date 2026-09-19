@@ -1,5 +1,6 @@
 #!/bin/sh
-# Comfy-Xtra production provisioner. Keep this file LF-only.
+# Comfy-Xtra production provisioner (NO DASHBOARD AUTH). Keep this file LF-only.
+# WARNING: port 17890 must be protected by your provider/firewall/reverse proxy if exposed publicly.
 set -eu
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
@@ -18,7 +19,6 @@ export HF_XET_HIGH_PERFORMANCE=1
 LOG_FILE="/var/log/provisioning_comfy_xtra.log"
 DASH_LOG="/var/log/comfy-xtra.log"
 ENV_FILE="/workspace/.comfy_xtra.env"
-PASS_FILE="/workspace/.comfy_xtra_password"
 mkdir -p /workspace /var/log
 exec >>"$LOG_FILE" 2>&1
 
@@ -36,8 +36,6 @@ retry(){
 
 RESOLVED_MONGO_URI="${MONGO_URI:-${MONGODB_URI:-${MONGO_URL:-}}}"
 DISCORD_URL="${DISCORD_WEBHOOK:-${DISCORD_WEBHOOK_URL:-}}"
-COMFY_XTRA_USER="${COMFY_XTRA_USER:-admin}"
-COMFY_XTRA_PASSWORD="${COMFY_XTRA_PASSWORD:-}"
 
 # Resolve Python before any helper needs it. Do not assume a system python3
 # exists just because the Vast shared venv exists.
@@ -45,20 +43,6 @@ if [[ -x /venv/main/bin/python ]]; then PYTHON_BIN=/venv/main/bin/python
 elif [[ -x /opt/conda/bin/python ]]; then PYTHON_BIN=/opt/conda/bin/python
 elif command -v python3 >/dev/null 2>&1; then PYTHON_BIN="$(command -v python3)"
 else log "ERROR: no Python environment found"; exit 1
-fi
-
-if [[ -z "$COMFY_XTRA_PASSWORD" ]]; then
-  if [[ -s "$PASS_FILE" ]]; then
-    COMFY_XTRA_PASSWORD="$(cat "$PASS_FILE")"
-  else
-    COMFY_XTRA_PASSWORD="$("$PYTHON_BIN" - <<'PYPASS'
-import secrets
-print(secrets.token_urlsafe(18))
-PYPASS
-)"
-    printf '%s\n' "$COMFY_XTRA_PASSWORD" > "$PASS_FILE"
-    chmod 600 "$PASS_FILE"
-  fi
 fi
 
 send_discord(){
@@ -282,8 +266,6 @@ done
 {
   printf 'export MONGO_URI=%q\n' "$RESOLVED_MONGO_URI"
   printf 'export DISCORD_WEBHOOK=%q\n' "$DISCORD_URL"
-  printf 'export COMFY_XTRA_USER=%q\n' "$COMFY_XTRA_USER"
-  printf 'export COMFY_XTRA_PASSWORD=%q\n' "$COMFY_XTRA_PASSWORD"
   printf 'export HF_XET_HIGH_PERFORMANCE=1\n'
 } > "$ENV_FILE"
 chmod 600 "$ENV_FILE"
@@ -303,7 +285,6 @@ import subprocess
 import urllib.request
 import urllib.parse
 import uuid
-import base64
 import logging
 from queue import Queue
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -338,8 +319,6 @@ GROUPS_COL = "groups"
 LOCAL_DB_PATH = "/workspace/model_manager.db"
 COMFY_BASE = "/workspace/ComfyUI/models"
 COMFY_INTERNAL_URL = "http://127.0.0.1:8188"
-AUTH_USER = os.environ.get("COMFY_XTRA_USER", "admin").strip() or "admin"
-AUTH_PASSWORD = os.environ.get("COMFY_XTRA_PASSWORD", "").strip()
 MAX_TASK_RETRIES = max(0, int(os.environ.get("COMFY_XTRA_MAX_TASK_RETRIES", "3")))
 
 logging.basicConfig(
@@ -1223,18 +1202,6 @@ class ManagerHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         logger.info("http %s - %s", self.address_string(), fmt % args)
 
-    def _require_auth(self):
-        if not AUTH_PASSWORD:
-            return True
-        expected = "Basic " + base64.b64encode(f"{AUTH_USER}:{AUTH_PASSWORD}".encode()).decode()
-        if self.headers.get("Authorization", "") == expected:
-            return True
-        self.send_response(401)
-        self.send_header("WWW-Authenticate", 'Basic realm="Comfy-Xtra"')
-        self.send_header("Content-Length", "0")
-        self.end_headers()
-        return False
-
     def _send_json(self, data, status=200):
         body = json.dumps(data).encode("utf-8")
         self.send_response(status)
@@ -1244,8 +1211,6 @@ class ManagerHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if not self._require_auth():
-            return
         url = urllib.parse.urlparse(self.path)
         if url.path == "/":
             self.serve_ui()
@@ -1306,8 +1271,6 @@ class ManagerHandler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
-        if not self._require_auth():
-            return
         url = urllib.parse.urlparse(self.path)
         length = int(self.headers.get("Content-Length", 0))
         raw_data = self.rfile.read(length).decode("utf-8") if length > 0 else "{}"
@@ -2715,7 +2678,7 @@ class ManagerHandler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     ThreadingHTTPServer.allow_reuse_address = True
     server = ThreadingHTTPServer(("0.0.0.0", 17890), ManagerHandler)
-    logger.info("Comfy-Xtra listening on :17890 (auth=%s)", "enabled" if AUTH_PASSWORD else "disabled")
+    logger.info("Comfy-Xtra listening on :17890 (authentication disabled)")
     try:
         server.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
@@ -2754,10 +2717,10 @@ fuser -k 17890/tcp >/dev/null 2>&1 || true
 nohup /usr/local/bin/comfy-xtra-supervisor.sh </dev/null >/dev/null 2>&1 &
 SUP_PID=$!
 
-# Do not report success until the service is actually accepting authenticated requests.
+# Do not report success until the service is actually accepting requests.
 ready=0
 for _ in $(seq 1 90); do
-  if curl -fsS -u "$COMFY_XTRA_USER:$COMFY_XTRA_PASSWORD" --connect-timeout 2 http://127.0.0.1:17890/api/health >/dev/null 2>&1; then ready=1; break; fi
+  if curl -fsS --connect-timeout 2 http://127.0.0.1:17890/api/health >/dev/null 2>&1; then ready=1; break; fi
   if ! kill -0 "$SUP_PID" >/dev/null 2>&1; then break; fi
   sleep 2
 done
@@ -2769,7 +2732,7 @@ if [[ "$ready" != 1 ]]; then
   exit 1
 fi
 
-log "Comfy-Xtra ready on port 17890; user=$COMFY_XTRA_USER password stored at $PASS_FILE"
+log "Comfy-Xtra ready on port 17890 (authentication disabled)"
 send_discord "🚀 Comfy-Xtra Online" "Dashboard passed health check on port `17890`." 238636
 exit 0
 PROV_EOF
@@ -2782,8 +2745,7 @@ delay=5
 while [ "$attempt" -le 4 ]; do
   if /bin/bash "$STAGED"; then
     echo "Comfy-Xtra provisioning completed successfully."
-    echo "Dashboard username: ${COMFY_XTRA_USER:-admin}"
-    echo "Dashboard password is stored in /workspace/.comfy_xtra_password"
+    echo "Dashboard authentication: disabled"
     exit 0
   fi
   rc=$?
