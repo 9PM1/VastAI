@@ -5,7 +5,7 @@ LOG_FILE="/var/log/provisioning_comfy_xtra.log"
 exec > >(tee -a "${LOG_FILE}") 2>&1
 
 echo "============================================================"
-echo " [1/6] Launching Automated Comfy-Xtra Provisioning Script   "
+echo " [1/6] Launching Automated Comfy-Xtra Provisioning Script    "
 echo "============================================================"
 
 # --- 1. Retry Function for Network & Package Installs ---
@@ -33,7 +33,7 @@ run_with_retry() {
 # --- 2. Install System Dependencies ---
 echo "=== [2/6] Verifying System Dependencies ==="
 run_with_retry "apt-get update" 3 3
-run_with_retry "apt-get install -y --no-install-recommends aria2 ca-certificates psmisc curl jq" 5 5
+run_with_retry "apt-get install -y --no-install-recommends aria2 ca-certificates psmisc curl jq supervisor" 5 5
 
 # --- 3. Resolve Python & Install Required Wheels ---
 echo "=== [3/6] Resolving Python & Installing pymongo ==="
@@ -85,7 +85,7 @@ import subprocess
 import urllib.request
 import urllib.parse
 from queue import Queue
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pymongo import MongoClient
 from pymongo.server_api import ServerApi
 
@@ -908,7 +908,7 @@ class ManagerHandler(BaseHTTPRequestHandler):
         elif url.path == "/api/disk":
             try:
                 total, used, free = shutil.disk_usage("/workspace")
-                pct = int((used / total) * 100)
+                pct = int((used / total) * 100) if total > 0 else 0
                 self._send_json({
                     "total": human_size(total),
                     "used": human_size(used),
@@ -971,21 +971,21 @@ class ManagerHandler(BaseHTTPRequestHandler):
                 self.send_error(404, "Favorite not found")
 
         elif url.path == "/api/favorites/refresh_all":
-            favs = get_all_favorites()
-            refreshed = 0
-            for f in favs:
-                if "civitai." in f.get("url", ""):
-                    meta = fetch_civitai_meta(f["url"])
-                    if meta:
-                        f["image_url"] = meta.get("image_url", f.get("image_url", ""))
-                        f["filename"] = meta.get("filename", f.get("filename", ""))
-                        f["total_bytes"] = meta.get("total_bytes", f.get("total_bytes", 0))
-                        f["trained_words"] = meta.get("trained_words", f.get("trained_words", []))
-                        if not f.get("name") or f["name"] == "Unnamed":
-                            f["name"] = meta.get("name", f["name"])
-                        save_favorite(f)
-                        refreshed += 1
-            self._send_json({"ok": True, "refreshed": refreshed})
+            def run_async_refresh():
+                favs = get_all_favorites()
+                for f in favs:
+                    if "civitai." in f.get("url", ""):
+                        meta = fetch_civitai_meta(f["url"])
+                        if meta:
+                            f["image_url"] = meta.get("image_url", f.get("image_url", ""))
+                            f["filename"] = meta.get("filename", f.get("filename", ""))
+                            f["total_bytes"] = meta.get("total_bytes", f.get("total_bytes", 0))
+                            f["trained_words"] = meta.get("trained_words", f.get("trained_words", []))
+                            if not f.get("name") or f["name"] == "Unnamed":
+                                f["name"] = meta.get("name", f["name"])
+                            save_favorite(f)
+            threading.Thread(target=run_async_refresh, daemon=True).start()
+            self._send_json({"ok": True, "message": "Async refresh scheduled"})
 
         elif url.path == "/api/favorites/delete":
             fav_id = payload.get("id")
@@ -1010,7 +1010,7 @@ class ManagerHandler(BaseHTTPRequestHandler):
             dst_file = os.path.join(dst_folder, filename)
 
             if os.path.exists(src_file) and not os.path.exists(dst_file):
-                os.rename(src_file, dst_file)
+                shutil.move(src_file, dst_file)
                 self._send_json({"ok": True})
             else:
                 self.send_error(400, "Source missing or destination file already exists")
@@ -1029,7 +1029,7 @@ class ManagerHandler(BaseHTTPRequestHandler):
             new_path = os.path.join(folder, new_name)
 
             if os.path.exists(old_path) and not os.path.exists(new_path):
-                os.rename(old_path, new_path)
+                shutil.move(old_path, new_path)
                 self._send_json({"ok": True})
             else:
                 self.send_error(400, "Source missing or destination already exists")
@@ -1200,44 +1200,16 @@ class ManagerHandler(BaseHTTPRequestHandler):
         button.cancel-btn { background: #21262d; color: var(--danger); border: 1px solid var(--danger); padding: 4px 10px; font-size: 12px; border-radius: 4px; }
         button.cancel-btn:hover { background: var(--danger); color: #fff; }
 
-        /* INTERACTIVE CYBERPUNK SWITCH */
         .startup-switch {
-            display: inline-flex;
-            align-items: center;
-            gap: 6px;
-            cursor: pointer;
-            user-select: none;
-            padding: 3px 8px;
-            border-radius: 14px;
-            font-size: 11px;
-            font-weight: 600;
-            border: 1px solid var(--border);
-            background: #090d12;
-            transition: all 0.2s ease;
+            display: inline-flex; align-items: center; gap: 6px; cursor: pointer; user-select: none;
+            padding: 3px 8px; border-radius: 14px; font-size: 11px; font-weight: 600;
+            border: 1px solid var(--border); background: #090d12; transition: all 0.2s ease;
         }
-        .startup-switch .switch-dot {
-            width: 10px;
-            height: 10px;
-            border-radius: 50%;
-            background: var(--subtext);
-            transition: all 0.2s ease;
-        }
-        .startup-switch.on {
-            border-color: var(--amber);
-            background: rgba(210,153,34,0.15);
-            color: var(--amber);
-        }
-        .startup-switch.on .switch-dot {
-            background: var(--amber);
-            box-shadow: 0 0 6px var(--amber);
-            transform: scale(1.15);
-        }
-        .startup-switch.off {
-            color: var(--subtext);
-            opacity: 0.85;
-        }
+        .startup-switch .switch-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--subtext); transition: all 0.2s ease; }
+        .startup-switch.on { border-color: var(--amber); background: rgba(210,153,34,0.15); color: var(--amber); }
+        .startup-switch.on .switch-dot { background: var(--amber); box-shadow: 0 0 6px var(--amber); transform: scale(1.15); }
+        .startup-switch.off { color: var(--subtext); opacity: 0.85; }
 
-        /* DISK BANNER */
         .disk-banner {
             background: #090d12; border: 1px solid var(--border); border-radius: 6px;
             padding: 10px 16px; margin-bottom: 20px; display: flex; align-items: center; justify-content: space-between;
@@ -1245,7 +1217,6 @@ class ManagerHandler(BaseHTTPRequestHandler):
         .disk-bar-bg { width: 200px; height: 8px; background: #21262d; border-radius: 4px; overflow: hidden; margin-left: 12px; }
         .disk-bar-fill { height: 100%; background: var(--blue); width: 0%; }
 
-        /* DOWNLOAD LIST & TASK CARDS */
         .task-list { display: flex; flex-direction: column; gap: 12px; margin-top: 14px; }
         .task-card {
             background: #090d12; border: 1px solid var(--border); border-radius: 8px;
@@ -1265,7 +1236,6 @@ class ManagerHandler(BaseHTTPRequestHandler):
         th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--border); font-size: 14px; }
         th { color: var(--subtext); font-size: 12px; text-transform: uppercase; }
 
-        /* DRAG AND DROP STYLES */
         .drag-table-wrap { transition: all 0.2s ease; border-radius: 6px; }
         .drag-table-wrap.drag-over { background: rgba(31,111,235,0.15) !important; outline: 2px dashed var(--blue); }
         tr.draggable-row { cursor: grab; }
@@ -1288,34 +1258,15 @@ class ManagerHandler(BaseHTTPRequestHandler):
         .meta-preview-box { display: flex; gap: 12px; align-items: center; background: #090d12; border: 1px solid var(--border); border-radius: 6px; padding: 10px; margin-bottom: 12px; }
         .meta-preview-img { width: 48px; height: 48px; border-radius: 4px; object-fit: cover; background: #161b22; flex-shrink: 0; }
 
-        /* TOAST BACKGROUND REMOVAL (Clean Floating Toast) */
         .swal2-container.swal2-top-end.swal2-backdrop-hide,
-        .swal2-container.swal2-top-end {
-            background: transparent !important;
-            box-shadow: none !important;
-        }
-        div:where(.swal2-container).swal2-toast {
-            background: transparent !important;
-            box-shadow: none !important;
-            border: 0 !important;
-            backdrop-filter: none !important;
-        }
-        div:where(.swal2-container).swal2-toast .swal2-title {
-            color: #fff !important;
-            font-size: 13px !important;
-            text-shadow: 0 2px 6px rgba(0,0,0,0.8);
-        }
+        .swal2-container.swal2-top-end { background: transparent !important; box-shadow: none !important; }
+        div:where(.swal2-container).swal2-toast { background: transparent !important; box-shadow: none !important; border: 0 !important; backdrop-filter: none !important; }
+        div:where(.swal2-container).swal2-toast .swal2-title { color: #fff !important; font-size: 13px !important; text-shadow: 0 2px 6px rgba(0,0,0,0.8); }
 
-        /* SWEETALERT MODAL DARK THEME */
         div:where(.swal2-container):not(.swal2-toast) { background: rgba(0,0,0,0.75) !important; }
         div:where(.swal2-container):not(.swal2-toast) div:where(.swal2-popup) {
-            background: #161b22 !important;
-            border: 1px solid var(--border) !important;
-            color: var(--text) !important;
-            border-radius: 8px !important;
-            overflow-x: hidden !important;
-            padding: 24px !important;
-            box-sizing: border-box !important;
+            background: #161b22 !important; border: 1px solid var(--border) !important; color: var(--text) !important;
+            border-radius: 8px !important; overflow-x: hidden !important; padding: 24px !important; box-sizing: border-box !important;
         }
         div:where(.swal2-container):not(.swal2-toast) .swal2-title { color: var(--blue) !important; font-size: 18px !important; }
         div:where(.swal2-container):not(.swal2-toast) .swal2-html-container { color: var(--text) !important; overflow: visible !important; margin: 12px 0 !important; text-align: left !important; }
@@ -1335,7 +1286,6 @@ class ManagerHandler(BaseHTTPRequestHandler):
         </div>
     </div>
 
-    <!-- DISK CAPACITY BAR -->
     <div class="disk-banner">
         <div style="font-size:13px;">
             <strong>NVMe Storage (/workspace):</strong> <span id="disk_details">Calculating...</span>
@@ -1349,7 +1299,6 @@ class ManagerHandler(BaseHTTPRequestHandler):
     </div>
 
     <div class="grid">
-        <!-- LEFT COLUMN: Settings, Webhooks, Downloads, Groups, Add Favorite, Workflow Parser -->
         <div>
             <div class="card">
                 <h3>🔑 Central API Keys & Webhooks</h3>
@@ -1362,7 +1311,6 @@ class ManagerHandler(BaseHTTPRequestHandler):
                 <button onclick="saveKeys()">Save Settings to Cloud DB</button>
             </div>
 
-            <!-- DIRECT DOWNLOAD WITH ACCURATE PROGRESS -->
             <div class="card">
                 <h3>📥 Direct Download</h3>
                 <label>Model Direct URL</label>
@@ -1396,7 +1344,6 @@ class ManagerHandler(BaseHTTPRequestHandler):
                 <div id="tasks" class="task-list"></div>
             </div>
 
-            <!-- WORKFLOW JSON MODEL PARSER -->
             <div class="card">
                 <h3>🧩 Extract Models from Workflow JSON</h3>
                 <label>Upload ComfyUI Workflow (.json)</label>
@@ -1404,7 +1351,6 @@ class ManagerHandler(BaseHTTPRequestHandler):
                 <div id="wf_results" style="margin-top:10px; font-size:13px;"></div>
             </div>
 
-            <!-- WORKFLOW GROUP CREATOR -->
             <div class="card">
                 <div style="display:flex; justify-content:space-between; align-items:center;">
                     <h3>📁 Workflow Groups</h3>
@@ -1413,7 +1359,6 @@ class ManagerHandler(BaseHTTPRequestHandler):
                 <div id="groups_pill_list" style="margin-top: 10px; display: flex; flex-wrap: wrap; gap: 6px;"></div>
             </div>
 
-            <!-- FAVORITE MODEL CREATOR -->
             <div class="card">
                 <h3>⭐ Save to Favorites</h3>
                 <label>Model Download URL</label>
@@ -1454,7 +1399,6 @@ class ManagerHandler(BaseHTTPRequestHandler):
             </div>
         </div>
 
-        <!-- RIGHT COLUMN: Favorites & Workflows, Installed Models (Draggable) -->
         <div>
             <div class="card">
                 <div style="display:flex; justify-content:space-between; align-items:center;">
@@ -1557,7 +1501,6 @@ class ManagerHandler(BaseHTTPRequestHandler):
             }
         }
 
-        // --- WORKFLOW PARSER ---
         async function parseWorkflowFile(e) {
             let file = e.target.files[0];
             if (!file) return;
@@ -1591,7 +1534,6 @@ class ManagerHandler(BaseHTTPRequestHandler):
             reader.readAsText(file);
         }
 
-        // --- CIVITAI PROBE HELPERS ---
         let currentDetectedDlMeta = null;
         let dlProbeTimer = null;
         let favProbeTimer = null;
@@ -1660,7 +1602,6 @@ class ManagerHandler(BaseHTTPRequestHandler):
             }, 450);
         }
 
-        // --- GROUP MANAGEMENT ---
         let cachedGroups = [];
         const EMOJI_PALETTE = ['📁', '⚡', '🎨', '🚀', '🔮', '✨', '🔥', '🌸', '🤖', '👑', '💎', '🎯'];
 
@@ -1800,7 +1741,6 @@ class ManagerHandler(BaseHTTPRequestHandler):
             }
         }
 
-        // --- FAVORITES MANAGEMENT ---
         let cachedFavs = [];
 
         async function addFavorite() {
@@ -1856,12 +1796,11 @@ class ManagerHandler(BaseHTTPRequestHandler):
         }
 
         async function refreshAllFavoritesMeta() {
-            Toast.fire({ icon: 'info', title: 'Re-fetching metadata from Civitai...' });
+            Toast.fire({ icon: 'info', title: 'Re-fetching metadata in background...' });
             let res = await fetch('/api/favorites/refresh_all', { method: 'POST' });
             let data = await res.json();
             if (data.ok) {
-                Toast.fire({ icon: 'success', title: `Updated ${data.refreshed} favorites with fresh metadata!` });
-                refreshFavorites();
+                setTimeout(refreshFavorites, 3000);
             }
         }
 
@@ -2102,7 +2041,6 @@ class ManagerHandler(BaseHTTPRequestHandler):
             }
         }
 
-        // --- DOWNLOAD & TASK CONTROL ---
         async function startDownload(urlOverride, catOverride, nameOverride) {
             let url = urlOverride || document.getElementById('dl_url').value.trim();
             let category = catOverride || document.getElementById('dl_cat').value;
@@ -2164,7 +2102,6 @@ class ManagerHandler(BaseHTTPRequestHandler):
             }
         }
 
-        // --- DRAG AND DROP FILE ORGANIZER ---
         let draggedModel = null;
 
         function handleDragStart(e, cat, fname) {
@@ -2213,7 +2150,6 @@ class ManagerHandler(BaseHTTPRequestHandler):
             }
         }
 
-        // --- INSTALLED MODEL ACTIONS ---
         async function renameModel(category, oldFilename) {
             let { value: newName } = await Swal.fire({
                 title: 'Rename File',
@@ -2387,7 +2323,7 @@ class ManagerHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 if __name__ == "__main__":
-    server = HTTPServer(("0.0.0.0", 17890), ManagerHandler)
+    server = ThreadingHTTPServer(("0.0.0.0", 17890), ManagerHandler)
     server.serve_forever()
 EOF
 
@@ -2400,7 +2336,7 @@ command=${PYTHON_BIN} /opt/x-dashboard.py
 autostart=true
 autorestart=true
 startretries=5
-environment=MONGO_URI="%(ENV_MONGO_URI)s",MONGODB_URI="%(ENV_MONGODB_URI)s",MONGO_URL="%(ENV_MONGO_URL)s"
+environment=MONGO_URI="${RESOLVED_MONGO_URI}"
 stderr_logfile=/var/log/supervisor/comfy-xtra.err.log
 stdout_logfile=/var/log/supervisor/comfy-xtra.out.log
 EOF
@@ -2408,6 +2344,16 @@ EOF
 # Release port 17890 if occupied
 if command -v fuser >/dev/null 2>&1; then
     fuser -k 17890/tcp || true
+fi
+
+# Ensure supervisor daemon is running before supervisorctl commands
+if ! pgrep -x "supervisord" >/dev/null 2>&1; then
+    if [ -f "/etc/supervisor/supervisord.conf" ]; then
+        supervisord -c /etc/supervisor/supervisord.conf
+    else
+        supervisord
+    fi
+    sleep 2
 fi
 
 supervisorctl reread
