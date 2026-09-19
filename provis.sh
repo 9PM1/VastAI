@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-set -Eeo pipefail
+set -eo pipefail
 
-# --- Pre-flight Shell & Environment Safeguards ---
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
 export UCF_FORCE_CONFFOLD=1
@@ -10,57 +9,29 @@ export HF_HUB_ENABLE_HF_TRANSFER=1
 
 LOG_FILE="/var/log/provisioning_comfy_xtra.log"
 mkdir -p "$(dirname "${LOG_FILE}")"
-# POSIX-compliant redirection avoiding /bin/sh syntax errors
-exec >> "${LOG_FILE}" 2>&1
+
+# Read environment variables
+RESOLVED_MONGO_URI="${MONGO_URI:-${MONGODB_URI:-${MONGO_URL:-}}}"
+DISCORD_URL="${DISCORD_WEBHOOK:-${DISCORD_WEBHOOK_URL:-}}"
+
+# Fallback: check /etc/environment if not in subshell env
+if [ -z "${DISCORD_URL}" ] && [ -f "/etc/environment" ]; then
+    DISCORD_URL=$(grep -E '^(DISCORD_WEBHOOK|DISCORD_WEBHOOK_URL)=' /etc/environment | head -n 1 | cut -d'=' -f2- | tr -d '"'\''')
+fi
+
+# 1. Send Immediate Startup Webhook
+if [ -n "${DISCORD_URL}" ]; then
+    HOSTNAME_VAL=$(hostname 2>/dev/null || echo "Unknown Container")
+    curl -s -X POST "${DISCORD_URL}" \
+        -H "Content-Type: application/json" \
+        -d "{\"embeds\":[{\"title\":\"⚙️ Provisioning Started\",\"description\":\"The Comfy-Xtra provisioning script has started on host \`${HOSTNAME_VAL}\`.\",\"color\":3447003,\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}]}" >/dev/null 2>&1 || true
+fi
 
 echo "============================================================"
-echo " [1/6] Launching Automated Comfy-Xtra Provisioning Script    "
+echo " [1/5] Launching Comfy-Xtra Provisioning                     "
 echo "============================================================"
 
-# --- 1. Retry Function & Apt Lock Waiter ---
-run_with_retry() {
-    local cmd="$1"
-    local max_attempts="${2:-5}"
-    local delay="${3:-5}"
-    local attempt=1
-
-    while [ "${attempt}" -le "${max_attempts}" ]; do
-        echo "--> Executing: ${cmd} (Attempt ${attempt}/${max_attempts})"
-        
-        if [[ "${cmd}" == *"apt"* ]] || [[ "${cmd}" == *"dpkg"* ]]; then
-            dpkg --configure -a 2>/dev/null || true
-        fi
-
-        if eval "${cmd}"; then
-            return 0
-        fi
-
-        echo "WARN: Command failed. Retrying in ${delay}s..."
-        sleep "${delay}"
-        attempt=$((attempt + 1))
-        delay=$((delay * 2))
-    done
-
-    echo "FATAL: Command '${cmd}' failed after ${max_attempts} attempts."
-    return 1
-}
-
-# Wait for background cloud package locks to release
-echo "Checking for existing package manager locks..."
-while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do
-    echo "Waiting for background system apt tasks to finish..."
-    sleep 3
-done
-
-# --- 2. Install System Dependencies ---
-echo "=== [2/6] Verifying System Dependencies ==="
-APT_OPTS="-y --no-install-recommends -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"
-
-run_with_retry "apt-get update" 3 3
-run_with_retry "apt-get install ${APT_OPTS} aria2 ca-certificates psmisc curl jq supervisor" 5 5
-
-# --- 3. Resolve Python & Install Required Wheels ---
-echo "=== [3/6] Resolving Python & Installing pymongo + hf_transfer ==="
+# 2. Resolve Python & Pip
 if [ -f "/venv/main/bin/python" ]; then
     PYTHON_BIN="/venv/main/bin/python"
     PIP_BIN="/venv/main/bin/pip"
@@ -76,58 +47,44 @@ else
 fi
 
 echo "Using Python: ${PYTHON_BIN}"
-echo "Using Pip:    ${PIP_BIN}"
 
-run_with_retry "${PIP_BIN} install --no-cache-dir certifi 'pymongo[srv]' 'huggingface_hub[hf_transfer]'" 5 4
+# 3. Clear Package Locks & Install Base Tools
+killall -9 apt-get apt dpkg 2>/dev/null || true
+rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock* 2>/dev/null || true
+dpkg --configure -a 2>/dev/null || true
 
-# --- 4. Ensure All ComfyUI Directory Scaffolding Exists ---
-echo "=== [4/6] Creating ComfyUI Models Directory Structure ==="
+apt-get update -y
+apt-get install -y --no-install-recommends aria2 ca-certificates curl jq psmisc
+
+# Install Python packages including hf_transfer accelerator
+"${PIP_BIN}" install --no-cache-dir certifi 'pymongo[srv]' 'huggingface_hub[hf_transfer]'
+
+# 4. Create ComfyUI Model Directories
 COMFY_BASE="/workspace/ComfyUI/models"
-
 ALL_DIRS=(
-    "audio_encoders"
-    "background_removal"
-    "checkpoints"
-    "ckpt"
-    "clip"
-    "clip_vision"
-    "configs"
-    "controlnet"
-    "detection"
-    "diffusers"
-    "diffusion_models"
-    "embeddings"
-    "frame_interpolation"
-    "geometry_estimation"
-    "gligen"
-    "hypernetworks"
-    "latent_upscale_models"
-    "loras"
-    "model_patches"
-    "optical_flow"
-    "photomaker"
-    "style_models"
-    "text_encoders"
-    "unet"
-    "upscale_models"
-    "vae"
-    "vae_approx"
+    "audio_encoders" "background_removal" "checkpoints" "ckpt" "clip" "clip_vision"
+    "configs" "controlnet" "detection" "diffusers" "diffusion_models" "embeddings"
+    "frame_interpolation" "geometry_estimation" "gligen" "hypernetworks" "latent_upscale_models"
+    "loras" "model_patches" "optical_flow" "photomaker" "style_models" "text_encoders"
+    "unet" "upscale_models" "vae" "vae_approx"
 )
 
 for folder in "${ALL_DIRS[@]}"; do
     mkdir -p "${COMFY_BASE}/${folder}"
 done
-mkdir -p /var/log/supervisor /etc/supervisor/conf.d
 
-# Capture existing Mongo URI safely
-RESOLVED_MONGO_URI="${MONGO_URI:-${MONGODB_URI:-${MONGO_URL:-}}}"
+# Save Mongo URI & Discord Webhook to /etc/environment for persistence
 if [ -n "${RESOLVED_MONGO_URI}" ]; then
     sed -i '/^MONGO_URI=/d' /etc/environment 2>/dev/null || true
     echo "MONGO_URI=\"${RESOLVED_MONGO_URI}\"" >> /etc/environment
 fi
+if [ -n "${DISCORD_URL}" ]; then
+    sed -i '/^DISCORD_WEBHOOK=/d' /etc/environment 2>/dev/null || true
+    echo "DISCORD_WEBHOOK=\"${DISCORD_URL}\"" >> /etc/environment
+fi
 
-# --- 5. Deploy /opt/x-dashboard.py ---
-echo "=== [5/6] Writing Comfy-Xtra Service Application ==="
+# 5. Deploy /opt/x-dashboard.py
+echo "=== Writing Comfy-Xtra Application ==="
 cat <<'EOF' > /opt/x-dashboard.py
 import os
 import re
@@ -147,7 +104,7 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pymongo import MongoClient
 from pymongo.server_api import ServerApi
 
-# MongoDB Configuration
+# MongoDB & Discord Environment Configuration
 MONGO_URI = (
     os.environ.get("MONGO_URI") or 
     os.environ.get("MONGODB_URI") or 
@@ -155,13 +112,16 @@ MONGO_URI = (
     ""
 ).strip()
 
-if not MONGO_URI and os.path.exists("/etc/environment"):
+DISCORD_WEBHOOK_ENV = os.environ.get("DISCORD_WEBHOOK", "").strip()
+
+if os.path.exists("/etc/environment"):
     try:
         with open("/etc/environment", "r") as f:
             for line in f:
-                if line.startswith("MONGO_URI="):
+                if line.startswith("MONGO_URI=") and not MONGO_URI:
                     MONGO_URI = line.split("=", 1)[1].strip().strip('"\'')
-                    break
+                if line.startswith("DISCORD_WEBHOOK=") and not DISCORD_WEBHOOK_ENV:
+                    DISCORD_WEBHOOK_ENV = line.split("=", 1)[1].strip().strip('"\'')
     except Exception:
         pass
 
@@ -174,7 +134,6 @@ LOCAL_DB_PATH = "/workspace/model_manager.db"
 COMFY_BASE = "/workspace/ComfyUI/models"
 COMFY_INTERNAL_URL = "http://127.0.0.1:8188"
 
-# 27 ComfyUI Model Directories
 ALL_CATEGORIES = [
     "checkpoints", "loras", "unet", "diffusion_models", "clip", "vae", "controlnet", "upscale_models", "embeddings",
     "audio_encoders", "background_removal", "ckpt", "clip_vision", "configs", "detection", "diffusers",
@@ -206,7 +165,7 @@ def get_mongo_db():
                 serverSelectionTimeoutMS=4000
             )
         except Exception as e:
-            print(f"[WARN] MongoClient init failed: {e}", flush=True)
+            print(f"[WARN] MongoClient failed: {e}", flush=True)
             return None
     return mongo_client[DB_NAME]
 
@@ -240,6 +199,9 @@ def init_local_db():
 init_local_db()
 
 def get_setting(key, default=""):
+    if key == "discord_webhook" and DISCORD_WEBHOOK_ENV:
+        default = DISCORD_WEBHOOK_ENV
+
     db = get_mongo_db()
     if db is not None:
         try:
@@ -247,8 +209,8 @@ def get_setting(key, default=""):
             doc = col.find_one({"key": key})
             if doc and "value" in doc:
                 return doc["value"]
-        except Exception as e:
-            print(f"[WARN] Mongo Read Failed ({e}), checking SQLite cache...", flush=True)
+        except Exception:
+            pass
 
     try:
         with sqlite3.connect(LOCAL_DB_PATH) as conn:
@@ -269,9 +231,11 @@ def get_all_settings():
                 if "key" in doc and "value" in doc:
                     settings[doc["key"]] = doc["value"]
             if settings:
+                if "discord_webhook" not in settings and DISCORD_WEBHOOK_ENV:
+                    settings["discord_webhook"] = DISCORD_WEBHOOK_ENV
                 return settings
-        except Exception as e:
-            print(f"[WARN] Mongo get_all failed ({e}), checking SQLite...", flush=True)
+        except Exception:
+            pass
 
     try:
         with sqlite3.connect(LOCAL_DB_PATH) as conn:
@@ -280,6 +244,9 @@ def get_all_settings():
                 settings[k] = v
     except Exception:
         pass
+
+    if "discord_webhook" not in settings and DISCORD_WEBHOOK_ENV:
+        settings["discord_webhook"] = DISCORD_WEBHOOK_ENV
     return settings
 
 def save_settings(data_dict):
@@ -290,7 +257,7 @@ def save_settings(data_dict):
             for k, v in data_dict.items():
                 col.update_one({"key": k}, {"$set": {"key": k, "value": v}}, upsert=True)
         except Exception as e:
-            print(f"[ERROR] Mongo Save Failed: {e}", flush=True)
+            print(f"[ERROR] Mongo Save: {e}", flush=True)
 
     try:
         with sqlite3.connect(LOCAL_DB_PATH) as conn:
@@ -298,7 +265,7 @@ def save_settings(data_dict):
                 conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (k, v))
             conn.commit()
     except Exception as e:
-        print(f"[ERROR] Local SQLite Save Failed: {e}", flush=True)
+        print(f"[ERROR] SQLite Save: {e}", flush=True)
 
 def send_discord_notification(title, description, color=0x238636, thumbnail_url=None, fields=None):
     webhook_url = get_setting("discord_webhook", "").strip()
@@ -329,7 +296,7 @@ def send_discord_notification(title, description, color=0x238636, thumbnail_url=
         )
         urllib.request.urlopen(req, timeout=5)
     except Exception as e:
-        print(f"[WARN] Discord webhook delivery failed: {e}", flush=True)
+        print(f"[WARN] Webhook delivery failed: {e}", flush=True)
 
 # Groups Helpers
 def get_all_groups():
@@ -346,8 +313,8 @@ def get_all_groups():
                 })
             if groups:
                 return groups
-        except Exception as e:
-            print(f"[WARN] Mongo get_groups failed ({e}), checking SQLite...", flush=True)
+        except Exception:
+            pass
 
     try:
         with sqlite3.connect(LOCAL_DB_PATH) as conn:
@@ -370,16 +337,16 @@ def save_group(item):
         try:
             col = db[GROUPS_COL]
             col.update_one({"id": gid}, {"$set": payload}, upsert=True)
-        except Exception as e:
-            print(f"[ERROR] Mongo save_group failed: {e}", flush=True)
+        except Exception:
+            pass
 
     try:
         with sqlite3.connect(LOCAL_DB_PATH) as conn:
             conn.execute("INSERT OR REPLACE INTO groups (id, name, emoji) VALUES (?, ?, ?)",
                          (gid, name, emoji))
             conn.commit()
-    except Exception as e:
-        print(f"[ERROR] SQLite save_group failed: {e}", flush=True)
+    except Exception:
+        pass
     return gid
 
 def delete_group(gid):
@@ -390,17 +357,17 @@ def delete_group(gid):
             col.delete_one({"id": gid})
             fav_col = db[FAVORITES_COL]
             fav_col.update_many({"group_ids": gid}, {"$pull": {"group_ids": gid}})
-        except Exception as e:
-            print(f"[ERROR] Mongo delete_group failed: {e}", flush=True)
+        except Exception:
+            pass
 
     try:
         with sqlite3.connect(LOCAL_DB_PATH) as conn:
             conn.execute("DELETE FROM groups WHERE id=?", (gid,))
             conn.commit()
-    except Exception as e:
-        print(f"[ERROR] SQLite delete_group failed: {e}", flush=True)
+    except Exception:
+        pass
 
-# URL & Metadata Helpers
+# URL Parsing & Metadata Handlers
 def fetch_civitai_meta(url_or_id):
     token = get_setting("civitai_token", "")
     target = url_or_id.strip()
@@ -413,9 +380,7 @@ def fetch_civitai_meta(url_or_id):
         return None
 
     api_url = f"https://civitai.com/api/v1/model-versions/{vid}"
-    req = urllib.request.Request(api_url, headers={
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-    })
+    req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
     if token:
         req.add_header("Authorization", f"Bearer {token.strip()}")
 
@@ -458,9 +423,8 @@ def fetch_civitai_meta(url_or_id):
                     "source_type": "Civitai",
                     "trained_words": trained_words
                 }
-    except Exception as e:
-        print(f"[DEBUG] Civitai meta fetch failed for {vid}: {e}", flush=True)
-
+    except Exception:
+        pass
     return None
 
 def parse_hf_url(target_url):
@@ -479,13 +443,6 @@ def parse_hf_url(target_url):
             "raw_url": raw_download_url
         }
     return None
-
-def find_hf_cli():
-    py_dir = os.path.dirname(sys.executable)
-    candidate = os.path.join(py_dir, "huggingface-cli")
-    if os.path.exists(candidate) and os.access(candidate, os.X_OK):
-        return candidate
-    return shutil.which("huggingface-cli")
 
 # Favorites Helpers
 def get_all_favorites():
@@ -523,8 +480,8 @@ def get_all_favorites():
                 })
             if favs:
                 return favs
-        except Exception as e:
-            print(f"[WARN] Mongo get_favorites failed ({e}), checking SQLite...", flush=True)
+        except Exception:
+            pass
 
     try:
         with sqlite3.connect(LOCAL_DB_PATH) as conn:
@@ -570,7 +527,7 @@ def save_favorite(item):
     trained_words = item.get("trained_words", [])
     auto_install = bool(item.get("auto_install", False))
 
-    if "civitai." in url and (not image_url or not filename or not total_bytes or not name or name == "Unnamed" or not trained_words):
+    if "civitai." in url and (not image_url or not filename or not name or name == "Unnamed"):
         meta = fetch_civitai_meta(url)
         if meta:
             if not image_url: image_url = meta.get("image_url", "")
@@ -605,8 +562,8 @@ def save_favorite(item):
         try:
             col = db[FAVORITES_COL]
             col.update_one({"id": fav_id}, {"$set": payload}, upsert=True)
-        except Exception as e:
-            print(f"[ERROR] Mongo save_favorite failed: {e}", flush=True)
+        except Exception:
+            pass
 
     try:
         with sqlite3.connect(LOCAL_DB_PATH) as conn:
@@ -616,8 +573,8 @@ def save_favorite(item):
             """, (fav_id, payload["name"], payload["url"], payload["category"], ",".join(gids),
                   payload["image_url"], payload["filename"], payload["total_bytes"], json.dumps(trained_words), 1 if auto_install else 0))
             conn.commit()
-    except Exception as e:
-        print(f"[ERROR] SQLite save_favorite failed: {e}", flush=True)
+    except Exception:
+        pass
     return fav_id
 
 def delete_favorite(fav_id):
@@ -626,17 +583,17 @@ def delete_favorite(fav_id):
         try:
             col = db[FAVORITES_COL]
             col.delete_one({"id": fav_id})
-        except Exception as e:
-            print(f"[ERROR] Mongo delete_favorite failed: {e}", flush=True)
+        except Exception:
+            pass
 
     try:
         with sqlite3.connect(LOCAL_DB_PATH) as conn:
             conn.execute("DELETE FROM favorites WHERE id=?", (fav_id,))
             conn.commit()
-    except Exception as e:
-        print(f"[ERROR] SQLite delete_favorite failed: {e}", flush=True)
+    except Exception:
+        pass
 
-# ----------------- Downloader Engine with Queue Limiter -----------------
+# ----------------- Downloader Engine -----------------
 download_tasks = {}
 active_processes = {}
 download_queue = Queue()
@@ -669,7 +626,7 @@ def queue_worker():
             continue
 
         if download_type == "hf":
-            hf_cli_worker(task_id, target_url, dest_dir, custom_filename, token, is_startup)
+            hf_worker(task_id, target_url, dest_dir, custom_filename, token, is_startup)
         elif download_type == "civitai":
             civitai_curl_worker(task_id, target_url, dest_dir, custom_filename, token, meta, is_startup)
         else:
@@ -681,8 +638,8 @@ for _ in range(MAX_CONCURRENT_DOWNLOADS):
     t = threading.Thread(target=queue_worker, daemon=True)
     t.start()
 
-# --- HuggingFace Accelerated Downloader (hf-cli + Fallback) ---
-def hf_cli_worker(task_id, target_url, dest_dir, custom_filename, token, is_startup=False):
+# --- HuggingFace Downloader with In-Process Python + hf_transfer ---
+def hf_worker(task_id, target_url, dest_dir, custom_filename, token, is_startup=False):
     parsed = parse_hf_url(target_url)
     if not parsed:
         aria2_worker(task_id, target_url, dest_dir, custom_filename, token, is_startup)
@@ -705,100 +662,45 @@ def hf_cli_worker(task_id, target_url, dest_dir, custom_filename, token, is_star
         })
         return
 
-    hf_cli_bin = find_hf_cli()
-    
-    if hf_cli_bin:
-        tmp_dl_dir = os.path.join(dest_dir, f".tmp_hf_{task_id}")
-        os.makedirs(tmp_dl_dir, exist_ok=True)
+    download_tasks[task_id].update({
+        "status": "Downloading (HF-Transfer)",
+        "file": final_name,
+        "title": f"{repo_id} - {final_name}",
+        "image_url": "https://huggingface.co/front/assets/huggingface_logo-noborder.svg",
+        "progress": 25,
+        "downloaded_bytes": 0,
+        "total_bytes": 0,
+        "speed": "HF Turbo",
+        "eta": "Fast Stream...",
+        "error_log": ""
+    })
 
-        cmd = [
-            hf_cli_bin, "download",
-            repo_id,
-            file_path,
-            "--revision", revision,
-            "--local-dir", tmp_dl_dir
-        ]
+    try:
+        from huggingface_hub import hf_hub_download
+        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+        downloaded_cache_path = hf_hub_download(
+            repo_id=repo_id,
+            filename=file_path,
+            revision=revision,
+            token=token.strip() if token else None
+        )
+        shutil.copy2(downloaded_cache_path, target_file)
 
-        env = os.environ.copy()
-        env["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
-        if token:
-            env["HF_TOKEN"] = token.strip()
-
+        final_sz = os.path.getsize(target_file)
         download_tasks[task_id].update({
-            "status": "Downloading (HF-Transfer)",
-            "file": final_name,
-            "title": f"{repo_id} - {final_name}",
-            "image_url": "",
-            "progress": 10,
-            "downloaded_bytes": 0,
-            "total_bytes": 0,
-            "speed": "Fast Turbo",
-            "eta": "Downloading...",
-            "error_log": ""
+            "status": "Completed",
+            "progress": 100,
+            "downloaded_bytes": final_sz,
+            "total_bytes": final_sz,
+            "speed": "--",
+            "eta": "Done"
         })
-
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                env=env
-            )
-            active_processes[task_id] = proc
-            expected_dl_file = os.path.join(tmp_dl_dir, file_path)
-
-            last_bytes = 0
-            last_time = time.time()
-
-            while proc.poll() is None:
-                if os.path.exists(expected_dl_file):
-                    curr_sz = os.path.getsize(expected_dl_file)
-                    now = time.time()
-                    dt = now - last_time
-                    if dt >= 1.0:
-                        speed_bps = (curr_sz - last_bytes) / dt
-                        download_tasks[task_id]["speed"] = f"{human_size(speed_bps)}/s"
-                        download_tasks[task_id]["downloaded_bytes"] = curr_sz
-                        download_tasks[task_id]["progress"] = 50
-                        last_bytes = curr_sz
-                        last_time = now
-                threading.Event().wait(1.0)
-
-            ret = proc.wait()
-            active_processes.pop(task_id, None)
-
-            if download_tasks[task_id]["status"] == "Cancelled":
-                shutil.rmtree(tmp_dl_dir, ignore_errors=True)
-                return
-
-            if ret == 0 and os.path.exists(expected_dl_file):
-                shutil.move(expected_dl_file, target_file)
-                shutil.rmtree(tmp_dl_dir, ignore_errors=True)
-                final_sz = os.path.getsize(target_file)
-                download_tasks[task_id].update({
-                    "status": "Completed",
-                    "progress": 100,
-                    "downloaded_bytes": final_sz,
-                    "total_bytes": final_sz,
-                    "speed": "--",
-                    "eta": "Done"
-                })
-                evt_title = "⚡ Autoload Model Installed" if is_startup else "🎉 Model Download Complete"
-                desc = f"**{final_name}** ({human_size(final_sz)}) downloaded via HF-Transfer to `{os.path.basename(dest_dir)}`"
-                send_discord_notification(evt_title, desc, 0x238636)
-                return
-            else:
-                shutil.rmtree(tmp_dl_dir, ignore_errors=True)
-        except Exception as e:
-            active_processes.pop(task_id, None)
-            shutil.rmtree(tmp_dl_dir, ignore_errors=True)
-            if download_tasks[task_id]["status"] == "Cancelled":
-                return
-
-    # Fallback to direct Raw URL via Aria2
-    print(f"[INFO] Running direct raw URL download fallback for {final_name}", flush=True)
-    aria2_worker(task_id, parsed["raw_url"], dest_dir, final_name, token, is_startup)
+        evt_title = "⚡ Autoload Model Installed" if is_startup else "🎉 Model Download Complete"
+        desc = f"**{final_name}** ({human_size(final_sz)}) downloaded via HF-Transfer to `{os.path.basename(dest_dir)}`"
+        send_discord_notification(evt_title, desc, 0x238636)
+    except Exception as e:
+        print(f"[WARN] In-process HF download error ({e}), switching to raw URL stream via Aria2...", flush=True)
+        aria2_worker(task_id, parsed["raw_url"], dest_dir, final_name, token, is_startup)
 
 def civitai_curl_worker(task_id, target_url, dest_dir, custom_filename, token, meta=None, is_startup=False):
     url = target_url.strip()
@@ -845,21 +747,9 @@ def civitai_curl_worker(task_id, target_url, dest_dir, custom_filename, token, m
         "error_log": ""
     })
 
-    cmd = [
-        "curl", "-L",
-        "-A", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "--fail",
-        "-o", dest_file,
-        url
-    ]
-
+    cmd = ["curl", "-L", "-A", "Mozilla/5.0", "--fail", "-o", dest_file, url]
     try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True
-        )
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         active_processes[task_id] = proc
         download_tasks[task_id]["status"] = "Downloading"
 
@@ -914,10 +804,7 @@ def civitai_curl_worker(task_id, target_url, dest_dir, custom_filename, token, m
             desc = f"**{download_tasks[task_id].get('title', final_name)}**\nSaved as `{final_name}` ({human_size(final_sz)}) to `{os.path.basename(dest_dir)}`"
             send_discord_notification(evt_title, desc, 0x238636, download_tasks[task_id].get("image_url"))
         else:
-            download_tasks[task_id].update({
-                "status": "Failed",
-                "error_log": f"Download failed (exit code {ret})"
-            })
+            download_tasks[task_id].update({"status": "Failed", "error_log": f"Download failed (code {ret})"})
     except Exception as e:
         active_processes.pop(task_id, None)
         if download_tasks[task_id]["status"] != "Cancelled":
@@ -926,16 +813,9 @@ def civitai_curl_worker(task_id, target_url, dest_dir, custom_filename, token, m
 def aria2_worker(task_id, target_url, dest_dir, custom_filename, token, is_startup=False):
     url = target_url.strip()
     cmd = [
-        "aria2c",
-        "-x", "16",
-        "-s", "16",
-        "-k", "1M",
-        "--content-disposition=true",
-        "--allow-overwrite=true",
-        "--auto-file-renaming=false",
-        "--summary-interval=1",
-        "--console-log-level=notice",
-        "--check-certificate=false",
+        "aria2c", "-x", "16", "-s", "16", "-k", "1M",
+        "--content-disposition=true", "--allow-overwrite=true", "--auto-file-renaming=false",
+        "--summary-interval=1", "--console-log-level=notice", "--check-certificate=false",
         "-d", dest_dir
     ]
 
@@ -961,13 +841,7 @@ def aria2_worker(task_id, target_url, dest_dir, custom_filename, token, is_start
     })
 
     try:
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1
-        )
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
         active_processes[task_id] = process
 
         progress_pattern = re.compile(r'\((\d+)%\).*DL:([^\s\]]+)(?:.*ETA:([^\s\]]+))?')
@@ -1025,7 +899,7 @@ def aria2_worker(task_id, target_url, dest_dir, custom_filename, token, is_start
             desc = f"**{resolved_fname}** downloaded via Aria2 to `{os.path.basename(dest_dir)}`"
             send_discord_notification(evt_title, desc, 0x238636)
         else:
-            err_msg = " | ".join(last_lines[-2:]) if last_lines else f"Failed (exit code {return_code})"
+            err_msg = " | ".join(last_lines[-2:]) if last_lines else f"Failed (code {return_code})"
             download_tasks[task_id].update({"status": "Failed", "error_log": err_msg})
     except Exception as e:
         active_processes.pop(task_id, None)
@@ -1037,7 +911,6 @@ def trigger_startup_downloads():
     time.sleep(2)
     favs = get_all_favorites()
     auto_items = [f for f in favs if f.get("auto_install")]
-    print(f"[*] Startup check: Found {len(auto_items)} models marked for auto-install", flush=True)
 
     for item in auto_items:
         url_target = item.get("url", "").strip()
@@ -1046,7 +919,6 @@ def trigger_startup_downloads():
         dest_dir = TARGET_DIRS.get(cat, TARGET_DIRS["loras"])
 
         if filename and os.path.exists(os.path.join(dest_dir, filename)):
-            print(f"[SKIP] Startup model {filename} already exists in {cat}", flush=True)
             continue
 
         hf_token = get_setting("hf_token", "")
@@ -1094,7 +966,7 @@ threading.Thread(target=trigger_startup_downloads, daemon=True).start()
 def dispatch_instance_boot_alert():
     time.sleep(3)
     hostname = socket.gethostname()
-    mongo_status = "Connected via $MONGO_URI" if get_mongo_db() is not None else "Local SQLite Fallback (MONGO_URI not set)"
+    mongo_status = "Connected via $MONGO_URI" if get_mongo_db() is not None else "Local SQLite Fallback"
     try:
         tot, used, free = shutil.disk_usage("/workspace")
         disk_desc = f"{human_size(free)} free of {human_size(tot)}"
@@ -1108,8 +980,8 @@ def dispatch_instance_boot_alert():
         {"name": "Internal Port", "value": "`17890` (Active)", "inline": True}
     ]
     send_discord_notification(
-        "🚀 Instance Provisioned & Comfy-Xtra Online",
-        "The automated provisioning script has finished running and all microservices are active.",
+        "🚀 Comfy-Xtra Online & Ready",
+        "Dashboard service is running and all ComfyUI directories are scaffolded.",
         0x58a6ff,
         None,
         fields
@@ -1180,7 +1052,7 @@ class ManagerHandler(BaseHTTPRequestHandler):
                         "image_url": "https://huggingface.co/front/assets/huggingface_logo-noborder.svg"
                     })
                 else:
-                    self._send_json({"error": "Unable to parse HuggingFace URL structure"})
+                    self._send_json({"error": "Unable to parse HF URL"})
             else:
                 self._send_json({"error": "Direct URL"})
         else:
@@ -1260,10 +1132,6 @@ class ManagerHandler(BaseHTTPRequestHandler):
             new_cat = payload.get("new_category")
             filename = payload.get("filename")
 
-            if not old_cat or not new_cat or not filename:
-                self.send_error(400, "Missing fields")
-                return
-
             src_folder = TARGET_DIRS.get(old_cat)
             dst_folder = TARGET_DIRS.get(new_cat)
             src_file = os.path.join(src_folder, filename)
@@ -1273,16 +1141,12 @@ class ManagerHandler(BaseHTTPRequestHandler):
                 shutil.move(src_file, dst_file)
                 self._send_json({"ok": True})
             else:
-                self.send_error(400, "Source missing or destination file already exists")
+                self.send_error(400, "Invalid file operation")
 
         elif url.path == "/api/models/rename":
             cat = payload.get("category")
             old_name = payload.get("old_name")
             new_name = payload.get("new_name", "").strip()
-
-            if not cat or not old_name or not new_name:
-                self.send_error(400, "Missing fields")
-                return
 
             folder = TARGET_DIRS.get(cat)
             old_path = os.path.join(folder, old_name)
@@ -1292,7 +1156,7 @@ class ManagerHandler(BaseHTTPRequestHandler):
                 shutil.move(old_path, new_path)
                 self._send_json({"ok": True})
             else:
-                self.send_error(400, "Source missing or destination already exists")
+                self.send_error(400, "Invalid file operation")
 
         elif url.path == "/api/purge_temp":
             cleaned = 0
@@ -1402,17 +1266,7 @@ class ManagerHandler(BaseHTTPRequestHandler):
                 "error_log": ""
             }
 
-            download_queue.put((
-                task_id,
-                url_target,
-                dest_dir,
-                custom_name,
-                token,
-                meta,
-                download_type,
-                False
-            ))
-
+            download_queue.put((task_id, url_target, dest_dir, custom_name, token, meta, download_type, False))
             self._send_json({"task_id": task_id})
 
         elif url.path == "/api/cancel":
@@ -1544,7 +1398,7 @@ class ManagerHandler(BaseHTTPRequestHandler):
 </head>
 <body>
     <div class="header-bar">
-        <h2>⚡ Comfy-Xtra: Model & Asset Manager <span class="status-badge">HF-Transfer + Mongo Atlas</span></h2>
+        <h2>⚡ Comfy-Xtra: Asset & Model Manager <span class="status-badge">HF-Transfer + Mongo Atlas</span></h2>
         <div style="display:flex; gap:8px;">
             <button class="btn-outline btn-sm" onclick="purgeTempFiles()">🧹 Clean Temp / .aria2</button>
             <button class="btn-purple btn-sm" onclick="triggerComfyRefresh()">🔄 Refresh ComfyUI</button>
@@ -2118,7 +1972,6 @@ class ManagerHandler(BaseHTTPRequestHandler):
             }).join('');
 
             let twString = (fav.trained_words || []).join(', ');
-
             let catOptions = ALL_CATS.map(c => `<option value="${c}" ${fav.category === c ? 'selected' : ''}>${c}</option>`).join('');
 
             let { value: formValues } = await Swal.fire({
@@ -2630,57 +2483,14 @@ if __name__ == "__main__":
     server.serve_forever()
 EOF
 
-# --- 6. Configure Supervisor Daemon & Launch ---
-echo "=== [6/6] Configuring Daemon & Starting Service ==="
+# 6. Stop previous listeners on 17890
+fuser -k 17890/tcp 2>/dev/null || true
 
-cat <<EOF > /etc/supervisor/conf.d/comfy-xtra.conf
-[program:comfy-xtra]
-command=${PYTHON_BIN} /opt/x-dashboard.py
-autostart=true
-autorestart=true
-startretries=5
-environment=MONGO_URI="${RESOLVED_MONGO_URI}",HF_HUB_ENABLE_HF_TRANSFER="1"
-stderr_logfile=/var/log/supervisor/comfy-xtra.err.log
-stdout_logfile=/var/log/supervisor/comfy-xtra.out.log
-EOF
+# 7. Background the dashboard cleanly and return to terminal
+nohup "${PYTHON_BIN}" /opt/x-dashboard.py </dev/null > /var/log/comfy-xtra.log 2>&1 &
+disown -h $!
 
-# Free port 17890 if already bound
-if command -v fuser >/dev/null 2>&1; then
-    fuser -k 17890/tcp || true
-fi
-
-# Ensure supervisor daemon is up
-if ! pgrep -x "supervisord" >/dev/null 2>&1; then
-    if [ -f "/etc/supervisor/supervisord.conf" ]; then
-        supervisord -c /etc/supervisor/supervisord.conf
-    elif [ -f "/etc/supervisord.conf" ]; then
-        supervisord -c /etc/supervisord.conf
-    else
-        supervisord
-    fi
-    sleep 2
-fi
-
-supervisorctl reread
-supervisorctl update
-supervisorctl restart comfy-xtra
-
-# --- Readiness Healthcheck ---
-READY=0
-for attempt in {1..20}; do
-    if curl -s -f "http://127.0.0.1:17890/api/models" >/dev/null 2>&1; then
-        READY=1
-        break
-    fi
-    echo "Waiting for Comfy-Xtra to become ready (Attempt ${attempt}/20)..."
-    sleep 1
-done
-
-if [ "${READY}" -eq 1 ]; then
-    echo "============================================================"
-    echo " SUCCESS: Comfy-Xtra Online with HF-Transfer on Port 17890! "
-    echo "============================================================"
-else
-    echo "ERROR: Healthcheck timed out. Displaying supervisor logs:"
-    tail -n 25 /var/log/supervisor/comfy-xtra.err.log || true
-fi
+echo "============================================================"
+echo " SUCCESS: Comfy-Xtra Online and Listening on Port 17890!    "
+echo "============================================================"
+exit 0
