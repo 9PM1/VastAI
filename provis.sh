@@ -73,190 +73,6 @@ retry 5 apt-get update -y
 retry 5 apt-get install -y --no-install-recommends aria2 ca-certificates curl jq psmisc openssl git procps
 retry 5 "$PYTHON_BIN" -m pip install --no-cache-dir -U certifi 'pymongo[srv]' huggingface_hub hf_xet
 
-# ---------------------------------------------------------------------------
-# Safe boot-time ComfyUI updater
-# - Runs once per container boot (/tmp marker)
-# - Sends Discord webhook before and after the update
-# - Updates comfy-cli, ComfyUI core, requirements, and installed custom nodes
-# - Snapshots clean Git repositories first and rolls them back on hard failure
-# - Update failures are non-fatal: the last working checkout is restored and
-#   provisioning continues so an upstream outage cannot brick the instance.
-# ---------------------------------------------------------------------------
-COMFY_DIR="${COMFY_DIR:-/workspace/ComfyUI}"
-COMFY_XTRA_AUTO_UPDATE="${COMFY_XTRA_AUTO_UPDATE:-1}"
-COMFY_XTRA_UPDATE_TIMEOUT="${COMFY_XTRA_UPDATE_TIMEOUT:-1200}"
-UPDATE_MARKER=/tmp/.comfy_xtra_update_done
-UPDATE_SNAPSHOT=/workspace/.comfy_xtra_update_snapshot.json
-UPDATE_LOG=/var/log/comfy-xtra-update.log
-
-git_short_rev(){
-  git -C "$1" rev-parse --short HEAD 2>/dev/null || printf 'unknown'
-}
-
-snapshot_comfy_repos(){
-  "$PYTHON_BIN" - "$COMFY_DIR" "$UPDATE_SNAPSHOT" <<'PYSNAP'
-import json, os, subprocess, sys
-root, out = sys.argv[1], sys.argv[2]
-repos = []
-candidates = [root]
-custom = os.path.join(root, "custom_nodes")
-if os.path.isdir(custom):
-    for name in os.listdir(custom):
-        p = os.path.join(custom, name)
-        if os.path.isdir(os.path.join(p, ".git")):
-            candidates.append(p)
-for path in candidates:
-    if not os.path.isdir(os.path.join(path, ".git")):
-        continue
-    try:
-        sha = subprocess.check_output(["git", "-C", path, "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL).strip()
-        dirty = bool(subprocess.check_output(["git", "-C", path, "status", "--porcelain"], text=True, stderr=subprocess.DEVNULL).strip())
-        repos.append({"path": path, "sha": sha, "dirty": dirty})
-    except Exception:
-        pass
-os.makedirs(os.path.dirname(out), exist_ok=True)
-with open(out, "w", encoding="utf-8") as f:
-    json.dump({"repos": repos}, f, indent=2)
-print(f"snapshotted {len(repos)} git repositories")
-PYSNAP
-}
-
-rollback_comfy_repos(){
-  [[ -s "$UPDATE_SNAPSHOT" ]] || return 0
-  "$PYTHON_BIN" - "$UPDATE_SNAPSHOT" <<'PYROLL'
-import json, os, subprocess, sys
-with open(sys.argv[1], encoding="utf-8") as f:
-    data = json.load(f)
-failed = []
-skipped_dirty = []
-for repo in data.get("repos", []):
-    path, sha, dirty = repo.get("path"), repo.get("sha"), repo.get("dirty")
-    if not path or not sha or not os.path.isdir(os.path.join(path, ".git")):
-        continue
-    if dirty:
-        skipped_dirty.append(path)
-        continue
-    try:
-        subprocess.run(["git", "-C", path, "reset", "--hard", sha], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
-    except Exception:
-        failed.append(path)
-print(f"rollback complete; skipped_dirty={len(skipped_dirty)} failed={len(failed)}")
-if failed:
-    print("rollback failures:", *failed, sep="\n - ")
-PYROLL
-
-  # Reconcile Python dependencies against the restored checkouts. This is
-  # best-effort because pip has no true transaction/rollback mechanism.
-  if [[ -f "$COMFY_DIR/requirements.txt" ]]; then
-    "$PYTHON_BIN" -m pip install --disable-pip-version-check --no-input -r "$COMFY_DIR/requirements.txt" >>"$UPDATE_LOG" 2>&1 || true
-  fi
-  local manager_cli="$COMFY_DIR/custom_nodes/ComfyUI-Manager/cm-cli.py"
-  if [[ -f "$manager_cli" ]]; then
-    COMFYUI_PATH="$COMFY_DIR" "$PYTHON_BIN" "$manager_cli" restore-dependencies >>"$UPDATE_LOG" 2>&1 || true
-  fi
-}
-
-run_with_update_timeout(){
-  if command -v timeout >/dev/null 2>&1; then
-    timeout --signal=TERM --kill-after=30s "${COMFY_XTRA_UPDATE_TIMEOUT}s" "$@"
-  else
-    "$@"
-  fi
-}
-
-sanity_check_comfy(){
-  [[ -f "$COMFY_DIR/main.py" ]] || return 1
-  "$PYTHON_BIN" -m py_compile "$COMFY_DIR/main.py" || return 1
-  "$PYTHON_BIN" - <<'PYTEST'
-import torch
-print("torch", torch.__version__, "cuda", torch.version.cuda, "available", torch.cuda.is_available())
-PYTEST
-}
-
-auto_update_comfy(){
-  if [[ "$COMFY_XTRA_AUTO_UPDATE" != "1" ]]; then
-    log "ComfyUI auto-update disabled by COMFY_XTRA_AUTO_UPDATE=$COMFY_XTRA_AUTO_UPDATE"
-    return 0
-  fi
-  if [[ -e "$UPDATE_MARKER" ]]; then
-    log "ComfyUI auto-update already attempted this boot; skipping"
-    return 0
-  fi
-  if [[ ! -d "$COMFY_DIR" || ! -f "$COMFY_DIR/main.py" ]]; then
-    log "WARN: ComfyUI not found at $COMFY_DIR; skipping update"
-    printf '%s skipped: ComfyUI missing\n' "$(date -Is)" > "$UPDATE_MARKER"
-    send_discord "⚠️ ComfyUI Update Skipped" "ComfyUI was not found at \`$COMFY_DIR\`; provisioning will continue." 16753920
-    return 0
-  fi
-
-  : > "$UPDATE_LOG"
-  local before_rev after_rev update_rc=0 update_mode="comfy-cli" warnings="no"
-  before_rev="$(git_short_rev "$COMFY_DIR")"
-  log "Starting ComfyUI boot-time update (current=$before_rev)"
-  send_discord "🔄 ComfyUI Update Started" "Updating ComfyUI core, Python requirements and installed custom nodes on \`$(hostname)\`. Current core: \`$before_rev\`." 3447003
-
-  snapshot_comfy_repos >>"$UPDATE_LOG" 2>&1 || true
-  "$PYTHON_BIN" -m pip freeze > /workspace/.comfy_xtra_pip_before_update.txt 2>/dev/null || true
-
-  # Keep the updater itself current. Failure here is not fatal; Manager/git
-  # fallback below can still update the installation.
-  if ! run_with_update_timeout "$PYTHON_BIN" -m pip install --disable-pip-version-check --no-input --no-cache-dir -U comfy-cli >>"$UPDATE_LOG" 2>&1; then
-    log "WARN: comfy-cli upgrade failed; trying fallback updater"
-  fi
-
-  local comfy_cli="$(dirname "$PYTHON_BIN")/comfy"
-  if [[ -x "$comfy_cli" ]]; then
-    if run_with_update_timeout "$comfy_cli" --workspace "$COMFY_DIR" update all --exit-on-fail >>"$UPDATE_LOG" 2>&1; then
-      update_rc=0
-    else
-      update_rc=$?
-    fi
-  else
-    update_mode="manager-fallback"
-    local manager_cli="$COMFY_DIR/custom_nodes/ComfyUI-Manager/cm-cli.py"
-    # Update core first. --ff-only avoids rewriting user history.
-    if [[ -d "$COMFY_DIR/.git" ]]; then
-      run_with_update_timeout git -C "$COMFY_DIR" pull --ff-only >>"$UPDATE_LOG" 2>&1 || update_rc=$?
-    fi
-    if (( update_rc == 0 )) && [[ -f "$COMFY_DIR/requirements.txt" ]]; then
-      run_with_update_timeout "$PYTHON_BIN" -m pip install --disable-pip-version-check --no-input -r "$COMFY_DIR/requirements.txt" >>"$UPDATE_LOG" 2>&1 || update_rc=$?
-    fi
-    if (( update_rc == 0 )) && [[ -f "$manager_cli" ]]; then
-      run_with_update_timeout env COMFYUI_PATH="$COMFY_DIR" "$PYTHON_BIN" "$manager_cli" update all >>"$UPDATE_LOG" 2>&1 || update_rc=$?
-    fi
-  fi
-
-  # comfy-cli/Manager may report individual node errors without a non-zero
-  # exit status. Record this as a warning but only rollback on a hard command
-  # failure or a failed sanity check.
-  if grep -Eiq '(^|[^A-Za-z])(ERROR|FAILED|Traceback)(:|[^A-Za-z])' "$UPDATE_LOG"; then
-    warnings="yes"
-  fi
-
-  if (( update_rc == 0 )) && sanity_check_comfy >>"$UPDATE_LOG" 2>&1; then
-    after_rev="$(git_short_rev "$COMFY_DIR")"
-    printf '%s success before=%s after=%s mode=%s warnings=%s\n' "$(date -Is)" "$before_rev" "$after_rev" "$update_mode" "$warnings" > "$UPDATE_MARKER"
-    log "ComfyUI update completed (before=$before_rev after=$after_rev mode=$update_mode warnings=$warnings)"
-    if [[ "$warnings" == "yes" ]]; then
-      send_discord "⚠️ ComfyUI Update Finished with Warnings" "Update completed and sanity checks passed. Core: \`$before_rev → $after_rev\`. Some custom-node updater warnings were detected; see \`$UPDATE_LOG\`." 16753920
-    else
-      send_discord "✅ ComfyUI Update Finished" "ComfyUI core + installed custom nodes are updated and sanity checks passed. Core: \`$before_rev → $after_rev\`." 5763719
-    fi
-    return 0
-  fi
-
-  local failed_rc="$update_rc"
-  (( failed_rc == 0 )) && failed_rc=1
-  log "WARN: ComfyUI update/sanity check failed rc=$failed_rc; restoring previous clean Git revisions"
-  rollback_comfy_repos >>"$UPDATE_LOG" 2>&1 || true
-  after_rev="$(git_short_rev "$COMFY_DIR")"
-  printf '%s rolled-back before=%s current=%s rc=%s\n' "$(date -Is)" "$before_rev" "$after_rev" "$failed_rc" > "$UPDATE_MARKER"
-  send_discord "🛟 ComfyUI Update Rolled Back" "The boot-time update failed (rc=\`$failed_rc\`). Clean Git repositories were restored to their previous revisions and provisioning will continue. Core now: \`$after_rev\`. See \`$UPDATE_LOG\`." 15105570
-  return 0
-}
-
-auto_update_comfy
-
 COMFY_BASE=/workspace/ComfyUI/models
 for folder in audio_encoders background_removal checkpoints ckpt clip clip_vision configs controlnet detection diffusers diffusion_models embeddings frame_interpolation geometry_estimation gligen hypernetworks latent_upscale_models loras model_patches optical_flow photomaker style_models text_encoders unet upscale_models vae vae_approx; do
   mkdir -p "$COMFY_BASE/$folder"
@@ -586,13 +402,47 @@ def delete_group(gid):
     except Exception:
         pass
 
+def resolve_civitai_version_id(url_or_id):
+    target = (url_or_id or "").strip().replace("civitai.red", "civitai.com")
+    if target.isdigit():
+        return target
+
+    parsed_url = urllib.parse.urlparse(target)
+    query = {key.lower(): values for key, values in urllib.parse.parse_qs(parsed_url.query).items()}
+    value = query.get("modelversionid", [""])[0]
+    if str(value).isdigit():
+        return str(value)
+
+    version_match = re.search(r'/(?:api/download/models|model-versions)/(\d+)', parsed_url.path, re.IGNORECASE)
+    if version_match:
+        return version_match.group(1)
+
+    # A regular /models/<model id> page does not contain a version id. Resolve
+    # it through the model API and use the newest version returned by Civitai.
+    model_match = re.search(r'/models/(\d+)', parsed_url.path, re.IGNORECASE)
+    if not model_match:
+        return None
+    token = get_setting("civitai_token", "")
+    req = urllib.request.Request(
+        f"https://civitai.com/api/v1/models/{model_match.group(1)}",
+        headers={"User-Agent": "Mozilla/5.0"},
+    )
+    if token:
+        req.add_header("Authorization", f"Bearer {token.strip()}")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        versions = data.get("modelVersions") or []
+        version_id = versions[0].get("id") if versions else None
+        return str(version_id) if version_id is not None else None
+    except Exception as exc:
+        logger.warning("Unable to resolve Civitai model version from %s: %s", target, exc)
+        return None
+
 def fetch_civitai_meta(url_or_id):
     token = get_setting("civitai_token", "")
-    target = url_or_id.strip()
-    m_param = re.search(r'[?&]modelVersionId=(\d+)', target, re.IGNORECASE)
-    m_path = re.search(r'(?:models|model-versions)/(\d+)', target)
-    vid = m_param.group(1) if m_param else (m_path.group(1) if m_path else target)
-    if not str(vid).isdigit():
+    vid = resolve_civitai_version_id(url_or_id)
+    if not vid:
         return None
     api_url = f"https://civitai.com/api/v1/model-versions/{vid}"
     req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
@@ -627,14 +477,15 @@ def fetch_civitai_meta(url_or_id):
                     "id": data.get("id"),
                     "name": disp_name or file_name,
                     "filename": file_name,
+                    "download_url": primary_file.get("downloadUrl") or f"https://civitai.com/api/download/models/{vid}",
                     "category": mapped_cat,
                     "total_bytes": total_bytes,
                     "image_url": img_url,
                     "source_type": "Civitai",
                     "trained_words": trained_words
                 }
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("Unable to fetch Civitai metadata for version %s: %s", vid, exc)
     return None
 
 def parse_hf_url(target_url):
@@ -644,7 +495,8 @@ def parse_hf_url(target_url):
         owner, repo, revision, filepath = match.groups()
         filepath = urllib.parse.unquote(filepath)
         filename = os.path.basename(filepath)
-        if not filename.lower().endswith(".safetensors"):
+        supported_exts = (".safetensors", ".ckpt", ".pt", ".pth", ".bin", ".gguf", ".onnx")
+        if not filename.lower().endswith(supported_exts):
             return None
         quoted_path = urllib.parse.quote(filepath, safe="/")
         raw_download_url = f"https://huggingface.co/{owner}/{repo}/resolve/{revision}/{quoted_path}"
@@ -688,10 +540,9 @@ def get_all_favorites():
                     "trained_words": t_words,
                     "auto_install": bool(doc.get("auto_install", False))
                 })
-            if favs:
-                return favs
-        except Exception:
-            pass
+            return favs
+        except Exception as exc:
+            logger.warning("MongoDB favorites read failed; using SQLite fallback: %s", exc)
     try:
         with sqlite3.connect(LOCAL_DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
@@ -925,11 +776,17 @@ def hf_worker(task_id, target_url, dest_dir, custom_filename, token, is_startup=
         download_tasks[task_id].update({"status": "Failed", "error_log": f"Hugging Face: {exc}"})
 
 def civitai_curl_worker(task_id, target_url, dest_dir, custom_filename, token, meta=None, is_startup=False):
-    url = target_url.strip().replace("civitai.red", "civitai.com")
-    if token:
-        url = re.sub(r'([?&])token=[^&]*', '', url)
-        delim = "&" if "?" in url else "?"
-        url = f"{url}{delim}token={token.strip()}"
+    meta = meta or fetch_civitai_meta(target_url) or {}
+    version_id = meta.get("id") or resolve_civitai_version_id(target_url)
+    url = (meta.get("download_url") or "").strip()
+    if not url and version_id:
+        url = f"https://civitai.com/api/download/models/{version_id}"
+    if not url:
+        download_tasks[task_id].update({
+            "status": "Failed",
+            "error_log": "Could not resolve a Civitai model-version download URL.",
+        })
+        return
 
     final_name = custom_filename.strip() or (meta.get("filename") if meta else "") or f"civitai_model_{task_id}.safetensors"
     final_name = safe_filename(final_name)
@@ -967,8 +824,10 @@ def civitai_curl_worker(task_id, target_url, dest_dir, custom_filename, token, m
         "--retry", "5", "--retry-delay", "3", "--retry-all-errors",
         "--connect-timeout", "15", "--max-time", "0", "-o", temp_file, url
     ]
+    if token:
+        cmd[1:1] = ["--header", f"Authorization: Bearer {token.strip()}"]
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         active_processes[task_id] = proc
         download_tasks[task_id]["status"] = "Downloading"
         last_bytes = 0
@@ -995,7 +854,8 @@ def civitai_curl_worker(task_id, target_url, dest_dir, custom_filename, token, m
                     last_time = now
             threading.Event().wait(1.0)
 
-        ret = proc.wait()
+        _, curl_error = proc.communicate()
+        ret = proc.returncode
         active_processes.pop(task_id, None)
 
         if download_tasks[task_id]["status"] == "Cancelled":
@@ -1007,8 +867,14 @@ def civitai_curl_worker(task_id, target_url, dest_dir, custom_filename, token, m
         if ret == 0:
             if not os.path.exists(temp_file):
                 raise RuntimeError("curl exited successfully but no file was created")
+            final_sz = os.path.getsize(temp_file)
+            if final_sz <= 1024:
+                raise RuntimeError("Civitai returned an unexpectedly small file")
+            with open(temp_file, "rb") as downloaded:
+                signature = downloaded.read(512).lstrip().lower()
+            if signature.startswith((b"<!doctype html", b"<html", b"{\"error\"", b"{\"message\"")):
+                raise RuntimeError("Civitai returned an HTML/API error response instead of model data")
             os.replace(temp_file, dest_file)
-            final_sz = os.path.getsize(dest_file)
             download_tasks[task_id].update({
                 "status": "Completed",
                 "progress": 100,
@@ -1021,9 +887,16 @@ def civitai_curl_worker(task_id, target_url, dest_dir, custom_filename, token, m
             desc = f"**{download_tasks[task_id].get('title', final_name)}**\nSaved as `{final_name}` ({human_size(final_sz)}) to `{os.path.basename(dest_dir)}`"
             send_discord_notification(evt_title, desc, 0x238636, download_tasks[task_id].get("image_url"))
         else:
-            download_tasks[task_id].update({"status": "Failed", "error_log": f"Download failed (code {ret})"})
+            detail = (curl_error or "").strip()[-500:]
+            message = f"Download failed (curl code {ret})"
+            if detail:
+                message += f": {detail}"
+            download_tasks[task_id].update({"status": "Failed", "error_log": message})
     except Exception as e:
         active_processes.pop(task_id, None)
+        if os.path.exists(temp_file):
+            try: os.remove(temp_file)
+            except Exception: pass
         if download_tasks[task_id]["status"] != "Cancelled":
             download_tasks[task_id].update({"status": "Error", "error_log": str(e)})
 
@@ -1422,6 +1295,10 @@ class ManagerHandler(BaseHTTPRequestHandler):
             url_target = payload.get("url", "").strip()
             category = payload.get("category", "loras")
             custom_name = payload.get("filename", "").strip()
+            parsed_target = urllib.parse.urlparse(url_target)
+            if parsed_target.scheme not in {"http", "https"} or not parsed_target.netloc:
+                self._send_json({"error": "A valid http(s) download URL is required"}, 400)
+                return
             if category not in TARGET_DIRS:
                 self._send_json({"error": "Invalid category"}, 400)
                 return
@@ -1440,9 +1317,12 @@ class ManagerHandler(BaseHTTPRequestHandler):
             hf_token = get_setting("hf_token", "")
             civitai_token = get_setting("civitai_token", "")
             task_id = uuid.uuid4().hex[:12]
-            is_civitai = "civitai." in url_target
-            is_hf = "huggingface.co" in url_target
+            target_lower = url_target.lower()
+            is_civitai = "civitai." in target_lower
+            is_hf = "huggingface.co" in target_lower
             meta = payload.get("meta")
+            if not isinstance(meta, dict):
+                meta = None
             if not meta and is_civitai:
                 meta = fetch_civitai_meta(url_target)
 
@@ -1450,11 +1330,19 @@ class ManagerHandler(BaseHTTPRequestHandler):
                 download_type = "hf"
                 token = hf_token
                 hf_parsed = parse_hf_url(url_target)
+                if not hf_parsed:
+                    self._send_json({"error": "Use a direct Hugging Face model-file URL (/resolve/ or /blob/)."}, 400)
+                    return
                 if not custom_name and hf_parsed:
                     custom_name = hf_parsed["display_filename"]
             elif is_civitai:
                 download_type = "civitai"
                 token = civitai_token
+                if not meta:
+                    self._send_json({"error": "Could not resolve that Civitai model/version URL. Check the URL and Civitai API token."}, 400)
+                    return
+                if not custom_name:
+                    custom_name = meta.get("filename", "")
             else:
                 download_type = "aria2"
                 token = ""
@@ -2125,11 +2013,16 @@ class ManagerHandler(BaseHTTPRequestHandler):
                 return;
             }
 
-            await fetch('/api/favorites', {
+            let res = await fetch('/api/favorites', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({ name, url, category, group_ids, image_url, filename, total_bytes, trained_words, auto_install })
             });
+            let data = await res.json();
+            if (!res.ok) {
+                Swal.fire({ icon: 'error', title: 'Could not save favorite', text: data.error || `HTTP ${res.status}` });
+                return;
+            }
 
             Toast.fire({ icon: 'success', title: 'Favorite saved!' });
             document.getElementById('fav_name').value = '';
@@ -2233,7 +2126,9 @@ class ManagerHandler(BaseHTTPRequestHandler):
             }
         }
 
-        async function deleteFavorite(id, name) {
+        async function deleteFavorite(id) {
+            let favorite = cachedFavs.find(f => f.id === id);
+            let name = favorite ? favorite.name : 'this favorite';
             let result = await Swal.fire({
                 title: 'Delete Favorite?',
                 text: `Remove "${name}" from all favorites?`,
@@ -2314,13 +2209,13 @@ class ManagerHandler(BaseHTTPRequestHandler):
                             <td><span style="font-family:monospace; font-size:12px;">${sz}</span></td>
                             <td><div style="display:flex; gap:4px; flex-wrap:wrap;">${pills}</div></td>
                             <td style="white-space:nowrap;">
-                                <button class="btn-sm" onclick="startDownload('${item.url}', '${item.category}', '${item.filename || ''}')">Download</button>
+                                <button class="btn-sm" onclick="downloadFavorite('${item.id}')">Download</button>
                                 <button class="btn-sm btn-outline" onclick="openEditFavoriteModal('${item.id}')">Edit</button>
                                 <span class="startup-switch ${switchClass}" title="Click to toggle Load on Startup" onclick="toggleFavoriteAuto('${item.id}')">
                                     <span class="switch-dot"></span>
                                     <span>${switchText}</span>
                                 </span>
-                                <button class="del" onclick="deleteFavorite('${item.id}', '${item.name.replace(/'/g, "\\'")}')">Remove</button>
+                                <button class="del" onclick="deleteFavorite('${item.id}')">Remove</button>
                             </td>
                         </tr>`;
                 }).join('');
@@ -2364,6 +2259,16 @@ class ManagerHandler(BaseHTTPRequestHandler):
             container.innerHTML = html;
         }
 
+        async function downloadFavorite(favId) {
+            let item = cachedFavs.find(f => f.id === favId);
+            if (!item) {
+                Toast.fire({ icon: 'error', title: 'Favorite not found. Refreshing list...' });
+                await refreshFavorites();
+                return false;
+            }
+            return startDownload(item.url, item.category, item.filename || '');
+        }
+
         async function installGroup(gid) {
             let g = cachedGroups.find(item => item.id === gid);
             let items = cachedFavs.filter(f => (f.group_ids || []).includes(gid));
@@ -2392,13 +2297,16 @@ class ManagerHandler(BaseHTTPRequestHandler):
         }
 
         async function startDownload(urlOverride, catOverride, nameOverride) {
-            let url = urlOverride || document.getElementById('dl_url').value.trim();
-            let category = catOverride || document.getElementById('dl_cat').value;
-            let filename = nameOverride || (document.getElementById('dl_name') ? document.getElementById('dl_name').value : '');
+            let hasOverride = typeof urlOverride === 'string';
+            let url = hasOverride ? urlOverride.trim() : document.getElementById('dl_url').value.trim();
+            let category = typeof catOverride === 'string' ? catOverride : document.getElementById('dl_cat').value;
+            let filename = typeof nameOverride === 'string'
+                ? nameOverride.trim()
+                : (document.getElementById('dl_name') ? document.getElementById('dl_name').value.trim() : '');
 
             if(!url) {
                 Toast.fire({ icon: 'warning', title: 'Please provide a download URL.' });
-                return;
+                return false;
             }
 
             let payload = { url, category, filename };
@@ -2406,28 +2314,39 @@ class ManagerHandler(BaseHTTPRequestHandler):
                 payload.meta = currentDetectedDlMeta;
             }
 
-            let res = await fetch('/api/download', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify(payload)
-            });
-            let data = await res.json();
+            let res;
+            let data;
+            try {
+                res = await fetch('/api/download', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(payload)
+                });
+                data = await res.json();
+            } catch (err) {
+                Toast.fire({ icon: 'error', title: `Download request failed: ${err.message}` });
+                return false;
+            }
 
             if (data.skipped) {
-                Toast.fire({ icon: 'info', title: `Skipped: ${filename} already exists!` });
-                return;
+                Toast.fire({ icon: 'info', title: data.message || `${filename || 'Model'} already exists` });
+                return true;
             }
 
             if (res.ok) {
                 Toast.fire({ icon: 'info', title: 'Download queued...' });
-                if (!urlOverride) {
+                if (!hasOverride) {
                     document.getElementById('dl_url').value = '';
                     if(document.getElementById('dl_name')) document.getElementById('dl_name').value = '';
                     document.getElementById('dl_meta_preview').style.display = 'none';
                     currentDetectedDlMeta = null;
                 }
+            } else {
+                Toast.fire({ icon: 'error', title: data.error || `Download failed (HTTP ${res.status})` });
+                return false;
             }
             refreshTasks();
+            return true;
         }
 
         async function cancelDownload(taskId) {
