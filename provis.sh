@@ -1,20 +1,23 @@
-#!/bin/bash
-set -Eeuo pipefail
+#!/usr/bin/env bash
+set -Eeo pipefail
 
 # --- Pre-flight Shell & Environment Safeguards ---
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
 export UCF_FORCE_CONFFOLD=1
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+export HF_HUB_ENABLE_HF_TRANSFER=1
 
 LOG_FILE="/var/log/provisioning_comfy_xtra.log"
 mkdir -p "$(dirname "${LOG_FILE}")"
-exec > >(tee -a "${LOG_FILE}") 2>&1
+# POSIX-compliant redirection (avoids process-substitution crashes under /bin/sh)
+exec >> "${LOG_FILE}" 2>&1
 
 echo "============================================================"
 echo " [1/6] Launching Automated Comfy-Xtra Provisioning Script    "
 echo "============================================================"
 
-# --- 1. Robust Retry Function for Headless Packages & Networks ---
+# --- 1. Robust Retry Function & Apt Lock Waiter ---
 run_with_retry() {
     local cmd="$1"
     local max_attempts="${2:-5}"
@@ -24,7 +27,6 @@ run_with_retry() {
     while [ "${attempt}" -le "${max_attempts}" ]; do
         echo "--> Executing: ${cmd} (Attempt ${attempt}/${max_attempts})"
         
-        # Clear any interrupted dpkg configuration state before running
         if [[ "${cmd}" == *"apt"* ]] || [[ "${cmd}" == *"dpkg"* ]]; then
             dpkg --configure -a 2>/dev/null || true
         fi
@@ -43,15 +45,22 @@ run_with_retry() {
     return 1
 }
 
-# --- 2. Install System Dependencies (Unattended & Lock-Safe) ---
+# Wait for background cloud-init / package locks to clear
+echo "Checking for existing package manager locks..."
+while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do
+    echo "Waiting for background system apt tasks to finish..."
+    sleep 3
+done
+
+# --- 2. Install System Dependencies ---
 echo "=== [2/6] Verifying System Dependencies ==="
 APT_OPTS="-y --no-install-recommends -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"
 
 run_with_retry "apt-get update" 3 3
 run_with_retry "apt-get install ${APT_OPTS} aria2 ca-certificates psmisc curl jq supervisor" 5 5
 
-# --- 3. Resolve Python & Install Required Wheels ---
-echo "=== [3/6] Resolving Python & Installing pymongo ==="
+# --- 3. Resolve Python & Install Required Wheels (including hf_transfer) ---
+echo "=== [3/6] Resolving Python & Installing pymongo + hf_transfer ==="
 if [ -f "/venv/main/bin/python" ]; then
     PYTHON_BIN="/venv/main/bin/python"
     PIP_BIN="/venv/main/bin/pip"
@@ -69,19 +78,49 @@ fi
 echo "Using Python: ${PYTHON_BIN}"
 echo "Using Pip:    ${PIP_BIN}"
 
-run_with_retry "${PIP_BIN} install --no-cache-dir certifi 'pymongo[srv]'" 5 4
+# Install certifi, pymongo, and huggingface_hub with Rust-based hf_transfer accelerator
+run_with_retry "${PIP_BIN} install --no-cache-dir certifi 'pymongo[srv]' 'huggingface_hub[hf_transfer]'" 5 4
 
-# --- 4. Ensure Directory Scaffolding Exists ---
-echo "=== [4/6] Creating Directory Structure ==="
+# --- 4. Ensure All ComfyUI Directory Scaffolding Exists ---
+echo "=== [4/6] Creating ComfyUI Models Directory Structure ==="
 COMFY_BASE="/workspace/ComfyUI/models"
-mkdir -p "${COMFY_BASE}/checkpoints" \
-         "${COMFY_BASE}/loras" \
-         "${COMFY_BASE}/vae" \
-         "${COMFY_BASE}/controlnet" \
-         /var/log/supervisor \
-         /etc/supervisor/conf.d
 
-# Capture existing environment Mongo URI into /etc/environment if present
+ALL_DIRS=(
+    "audio_encoders"
+    "background_removal"
+    "checkpoints"
+    "ckpt"
+    "clip"
+    "clip_vision"
+    "configs"
+    "controlnet"
+    "detection"
+    "diffusers"
+    "diffusion_models"
+    "embeddings"
+    "frame_interpolation"
+    "geometry_estimation"
+    "gligen"
+    "hypernetworks"
+    "latent_upscale_models"
+    "loras"
+    "model_patches"
+    "optical_flow"
+    "photomaker"
+    "style_models"
+    "text_encoders"
+    "unet"
+    "upscale_models"
+    "vae"
+    "vae_approx"
+)
+
+for folder in "${ALL_DIRS[@]}"; do
+    mkdir -p "${COMFY_BASE}/${folder}"
+done
+mkdir -p /var/log/supervisor /etc/supervisor/conf.d
+
+# Capture existing environment Mongo URI safely without unbound variable crashes
 RESOLVED_MONGO_URI="${MONGO_URI:-${MONGODB_URI:-${MONGO_URL:-}}}"
 if [ -n "${RESOLVED_MONGO_URI}" ]; then
     sed -i '/^MONGO_URI=/d' /etc/environment 2>/dev/null || true
@@ -93,6 +132,7 @@ echo "=== [5/6] Writing Comfy-Xtra Service Application ==="
 cat <<'EOF' > /opt/x-dashboard.py
 import os
 import re
+import sys
 import time
 import json
 import shutil
@@ -108,7 +148,7 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pymongo import MongoClient
 from pymongo.server_api import ServerApi
 
-# MongoDB Configuration: Read from Vast.ai environment table
+# MongoDB Configuration
 MONGO_URI = (
     os.environ.get("MONGO_URI") or 
     os.environ.get("MONGODB_URI") or 
@@ -116,7 +156,6 @@ MONGO_URI = (
     ""
 ).strip()
 
-# Check /etc/environment fallback if supervisor stripped container env
 if not MONGO_URI and os.path.exists("/etc/environment"):
     try:
         with open("/etc/environment", "r") as f:
@@ -132,18 +171,23 @@ SETTINGS_COL = "settings"
 FAVORITES_COL = "favorites"
 GROUPS_COL = "groups"
 
-# Fallback & Target Directories
 LOCAL_DB_PATH = "/workspace/model_manager.db"
 COMFY_BASE = "/workspace/ComfyUI/models"
 COMFY_INTERNAL_URL = "http://127.0.0.1:8188"
 
-TARGET_DIRS = {
-    "checkpoint": os.path.join(COMFY_BASE, "checkpoints"),
-    "lora": os.path.join(COMFY_BASE, "loras"),
-    "vae": os.path.join(COMFY_BASE, "vae"),
-    "controlnet": os.path.join(COMFY_BASE, "controlnet"),
-}
+# 27 ComfyUI Model Directories
+ALL_CATEGORIES = [
+    "checkpoints", "loras", "unet", "diffusion_models", "clip", "vae", "controlnet", "upscale_models", "embeddings",
+    "audio_encoders", "background_removal", "ckpt", "clip_vision", "configs", "detection", "diffusers",
+    "frame_interpolation", "geometry_estimation", "gligen", "hypernetworks", "latent_upscale_models",
+    "model_patches", "optical_flow", "photomaker", "style_models", "text_encoders", "vae_approx"
+]
 
+PRIORITY_CATEGORIES = [
+    "checkpoints", "loras", "unet", "diffusion_models", "clip", "vae", "controlnet", "upscale_models", "embeddings"
+]
+
+TARGET_DIRS = {cat: os.path.join(COMFY_BASE, cat) for cat in ALL_CATEGORIES}
 for folder in TARGET_DIRS.values():
     os.makedirs(folder, exist_ok=True)
 
@@ -228,7 +272,7 @@ def get_all_settings():
             if settings:
                 return settings
         except Exception as e:
-            print(f"[WARN] Mongo get_all failed ({e}), checking SQLite cache...", flush=True)
+            print(f"[WARN] Mongo get_all failed ({e}), checking SQLite...", flush=True)
 
     try:
         with sqlite3.connect(LOCAL_DB_PATH) as conn:
@@ -357,7 +401,7 @@ def delete_group(gid):
     except Exception as e:
         print(f"[ERROR] SQLite delete_group failed: {e}", flush=True)
 
-# Civitai Metadata Inspection
+# Metadata Helpers
 def fetch_civitai_meta(url_or_id):
     token = get_setting("civitai_token", "")
     target = url_or_id.strip()
@@ -384,13 +428,15 @@ def fetch_civitai_meta(url_or_id):
                 m_type = (model_info.get("type") or "LORA").upper()
 
                 cat_map = {
-                    "CHECKPOINT": "checkpoint",
-                    "LORA": "lora",
-                    "LOCON": "lora",
+                    "CHECKPOINT": "checkpoints",
+                    "LORA": "loras",
+                    "LOCON": "loras",
                     "VAE": "vae",
-                    "CONTROLNET": "controlnet"
+                    "CONTROLNET": "controlnet",
+                    "UPSCALER": "upscale_models",
+                    "TEXTUALINVERSION": "embeddings"
                 }
-                mapped_cat = cat_map.get(m_type, "lora")
+                mapped_cat = cat_map.get(m_type, "loras")
 
                 files = data.get("files", [])
                 primary_file = next((f for f in files if f.get("primary")), files[0] if files else {})
@@ -410,12 +456,27 @@ def fetch_civitai_meta(url_or_id):
                     "category": mapped_cat,
                     "total_bytes": total_bytes,
                     "image_url": img_url,
-                    "civitai_type": m_type,
+                    "source_type": "Civitai",
                     "trained_words": trained_words
                 }
     except Exception as e:
         print(f"[DEBUG] Civitai meta fetch failed for {vid}: {e}", flush=True)
 
+    return None
+
+def parse_hf_url(target_url):
+    clean = target_url.strip()
+    match = re.search(r'huggingface\.co/([^/]+)/([^/]+)/(?:resolve|blob)/([^/?#]+)/(.+?)(?:\?.*)?$', clean)
+    if match:
+        owner, repo, revision, filepath = match.groups()
+        filepath = urllib.parse.unquote(filepath)
+        filename = os.path.basename(filepath)
+        return {
+            "repo_id": f"{owner}/{repo}",
+            "filename": filepath,
+            "display_filename": filename,
+            "revision": revision
+        }
     return None
 
 # Favorites Helpers
@@ -444,7 +505,7 @@ def get_all_favorites():
                     "id": str(doc.get("id") or doc.get("_id")),
                     "name": doc.get("name", "Unnamed"),
                     "url": doc.get("url", ""),
-                    "category": doc.get("category", "lora"),
+                    "category": doc.get("category", "loras"),
                     "group_ids": clean_gids,
                     "image_url": doc.get("image_url", ""),
                     "filename": doc.get("filename", ""),
@@ -494,7 +555,7 @@ def save_favorite(item):
 
     url = item.get("url", "").strip()
     name = item.get("name", "").strip()
-    category = item.get("category", "lora")
+    category = item.get("category", "loras")
     image_url = item.get("image_url", "").strip()
     filename = item.get("filename", "").strip()
     total_bytes = item.get("total_bytes", 0)
@@ -508,8 +569,15 @@ def save_favorite(item):
             if not filename: filename = meta.get("filename", "")
             if not total_bytes: total_bytes = meta.get("total_bytes", 0)
             if not name or name == "Unnamed": name = meta.get("name", "")
-            if not category: category = meta.get("category", "lora")
+            if not category: category = meta.get("category", "loras")
             if not trained_words: trained_words = meta.get("trained_words", [])
+
+    if "huggingface.co" in url and not filename:
+        hf_parsed = parse_hf_url(url)
+        if hf_parsed:
+            filename = hf_parsed["display_filename"]
+            if not name or name == "Unnamed":
+                name = filename
 
     payload = {
         "id": fav_id,
@@ -587,19 +655,138 @@ def queue_worker():
         task_info = download_queue.get()
         if task_info is None:
             break
-        task_id, target_url, dest_dir, custom_filename, token, meta, is_civitai, is_startup = task_info
+        task_id, target_url, dest_dir, custom_filename, token, meta, download_type, is_startup = task_info
         if download_tasks.get(task_id, {}).get("status") == "Cancelled":
             download_queue.task_done()
             continue
-        if is_civitai:
+
+        if download_type == "hf":
+            hf_cli_worker(task_id, target_url, dest_dir, custom_filename, token, is_startup)
+        elif download_type == "civitai":
             civitai_curl_worker(task_id, target_url, dest_dir, custom_filename, token, meta, is_startup)
         else:
             aria2_worker(task_id, target_url, dest_dir, custom_filename, token, is_startup)
+
         download_queue.task_done()
 
 for _ in range(MAX_CONCURRENT_DOWNLOADS):
     t = threading.Thread(target=queue_worker, daemon=True)
     t.start()
+
+# --- HuggingFace Accelerated Downloader (hf-cli + hf_transfer) ---
+def hf_cli_worker(task_id, target_url, dest_dir, custom_filename, token, is_startup=False):
+    parsed = parse_hf_url(target_url)
+    if not parsed:
+        aria2_worker(task_id, target_url, dest_dir, custom_filename, token, is_startup)
+        return
+
+    repo_id = parsed["repo_id"]
+    file_path = parsed["filename"]
+    revision = parsed["revision"]
+    final_name = custom_filename.strip() or parsed["display_filename"]
+    target_file = os.path.join(dest_dir, final_name)
+
+    if os.path.exists(target_file) and os.path.getsize(target_file) > 1024:
+        download_tasks[task_id].update({
+            "status": "Completed",
+            "progress": 100,
+            "downloaded_bytes": os.path.getsize(target_file),
+            "total_bytes": os.path.getsize(target_file),
+            "speed": "--",
+            "eta": "Already Exists"
+        })
+        return
+
+    download_tasks[task_id].update({
+        "status": "Accelerating (HF-CLI)",
+        "file": final_name,
+        "title": f"{repo_id} - {final_name}",
+        "image_url": "",
+        "progress": 5,
+        "downloaded_bytes": 0,
+        "total_bytes": 0,
+        "speed": "HF-Transfer",
+        "eta": "Connecting...",
+        "error_log": ""
+    })
+
+    # Prepare isolated local directory to download using huggingface-cli
+    tmp_dl_dir = os.path.join(dest_dir, f".tmp_hf_{task_id}")
+    os.makedirs(tmp_dl_dir, exist_ok=True)
+
+    cmd = [
+        sys.executable, "-m", "huggingface_hub.cli.core", "download",
+        repo_id,
+        file_path,
+        "--revision", revision,
+        "--local-dir", tmp_dl_dir
+    ]
+
+    env = os.environ.copy()
+    env["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+    if token:
+        env["HF_TOKEN"] = token.strip()
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env
+        )
+        active_processes[task_id] = proc
+        download_tasks[task_id]["status"] = "Downloading (HF-Transfer)"
+
+        expected_dl_file = os.path.join(tmp_dl_dir, file_path)
+        last_bytes = 0
+        last_time = time.time()
+
+        while proc.poll() is None:
+            if os.path.exists(expected_dl_file):
+                curr_sz = os.path.getsize(expected_dl_file)
+                now = time.time()
+                dt = now - last_time
+                if dt >= 1.0:
+                    speed_bps = (curr_sz - last_bytes) / dt
+                    download_tasks[task_id]["speed"] = f"{human_size(speed_bps)}/s"
+                    download_tasks[task_id]["downloaded_bytes"] = curr_sz
+                    last_bytes = curr_sz
+                    last_time = now
+            threading.Event().wait(1.0)
+
+        ret = proc.wait()
+        active_processes.pop(task_id, None)
+
+        if download_tasks[task_id]["status"] == "Cancelled":
+            shutil.rmtree(tmp_dl_dir, ignore_errors=True)
+            return
+
+        if ret == 0 and os.path.exists(expected_dl_file):
+            shutil.move(expected_dl_file, target_file)
+            shutil.rmtree(tmp_dl_dir, ignore_errors=True)
+
+            final_sz = os.path.getsize(target_file)
+            download_tasks[task_id].update({
+                "status": "Completed",
+                "progress": 100,
+                "downloaded_bytes": final_sz,
+                "total_bytes": final_sz,
+                "speed": "--",
+                "eta": "Done"
+            })
+            evt_title = "⚡ Autoload Model Installed" if is_startup else "🎉 Model Download Complete"
+            desc = f"**{final_name}** ({human_size(final_sz)}) downloaded via HF-Transfer to `{os.path.basename(dest_dir)}`"
+            send_discord_notification(evt_title, desc, 0x238636)
+        else:
+            err_msg = f"HF-CLI download failed (code {ret})"
+            download_tasks[task_id].update({"status": "Failed", "error_log": err_msg})
+            shutil.rmtree(tmp_dl_dir, ignore_errors=True)
+    except Exception as e:
+        active_processes.pop(task_id, None)
+        shutil.rmtree(tmp_dl_dir, ignore_errors=True)
+        if download_tasks[task_id]["status"] != "Cancelled":
+            download_tasks[task_id].update({"status": "Error", "error_log": str(e)})
 
 def civitai_curl_worker(task_id, target_url, dest_dir, custom_filename, token, meta=None, is_startup=False):
     url = target_url.strip()
@@ -740,9 +927,6 @@ def aria2_worker(task_id, target_url, dest_dir, custom_filename, token, is_start
         "-d", dest_dir
     ]
 
-    if "huggingface.co" in url and token:
-        cmd.extend(["--header", f"Authorization: Bearer {token.strip()}"])
-
     if custom_filename.strip():
         cmd.extend(["-o", custom_filename.strip()])
 
@@ -835,9 +1019,9 @@ def trigger_startup_downloads():
 
     for item in auto_items:
         url_target = item.get("url", "").strip()
-        cat = item.get("category", "lora")
+        cat = item.get("category", "loras")
         filename = item.get("filename", "").strip()
-        dest_dir = TARGET_DIRS.get(cat, TARGET_DIRS["lora"])
+        dest_dir = TARGET_DIRS.get(cat, TARGET_DIRS["loras"])
 
         if filename and os.path.exists(os.path.join(dest_dir, filename)):
             print(f"[SKIP] Startup model {filename} already exists in {cat}", flush=True)
@@ -846,7 +1030,19 @@ def trigger_startup_downloads():
         hf_token = get_setting("hf_token", "")
         civitai_token = get_setting("civitai_token", "")
         task_id = str(len(download_tasks) + 1)
+
         is_civitai = "civitai." in url_target
+        is_hf = "huggingface.co" in url_target
+
+        if is_hf:
+            download_type = "hf"
+            token = hf_token
+        elif is_civitai:
+            download_type = "civitai"
+            token = civitai_token
+        else:
+            download_type = "aria2"
+            token = ""
 
         meta = {
             "name": item.get("name"),
@@ -868,8 +1064,7 @@ def trigger_startup_downloads():
             "error_log": ""
         }
 
-        download_queue.put((task_id, url_target, dest_dir, filename,
-                            civitai_token if is_civitai else hf_token, meta, is_civitai, True))
+        download_queue.put((task_id, url_target, dest_dir, filename, token, meta, download_type, True))
 
 threading.Thread(target=trigger_startup_downloads, daemon=True).start()
 
@@ -921,7 +1116,7 @@ class ManagerHandler(BaseHTTPRequestHandler):
                 if os.path.exists(folder):
                     for f in os.listdir(folder):
                         full = os.path.join(folder, f)
-                        if os.path.isfile(full) and not f.endswith((".aria2", ".crdownload", ".tmp")):
+                        if os.path.isfile(full) and not f.endswith((".aria2", ".crdownload", ".tmp")) and not f.startswith(".tmp_"):
                             models[cat].append({"name": f, "size": human_size(os.path.getsize(full))})
             self._send_json(models)
         elif url.path == "/api/disk":
@@ -944,11 +1139,28 @@ class ManagerHandler(BaseHTTPRequestHandler):
             self._send_json(get_all_favorites())
         elif url.path == "/api/tasks":
             self._send_json(download_tasks)
-        elif url.path == "/api/civitai_probe":
+        elif url.path == "/api/probe":
             query = urllib.parse.parse_qs(url.query)
-            target = query.get("url", [""])[0]
-            meta = fetch_civitai_meta(target)
-            self._send_json(meta or {"error": "Not found"})
+            target = query.get("url", [""])[0].strip()
+
+            if "civitai." in target:
+                meta = fetch_civitai_meta(target)
+                self._send_json(meta or {"error": "Not found"})
+            elif "huggingface.co" in target:
+                parsed = parse_hf_url(target)
+                if parsed:
+                    self._send_json({
+                        "name": parsed["display_filename"],
+                        "filename": parsed["display_filename"],
+                        "category": "checkpoints" if any(x in parsed["display_filename"].lower() for x in ["checkpoint", "base", "flux", "sdxl", "v1-5"]) else "loras",
+                        "source_type": "HuggingFace (HF-Transfer)",
+                        "total_bytes": 0,
+                        "image_url": "https://huggingface.co/front/assets/huggingface_logo-noborder.svg"
+                    })
+                else:
+                    self._send_json({"error": "Unable to parse HuggingFace URL structure"})
+            else:
+                self._send_json({"error": "Direct URL"})
         else:
             self.send_error(404)
 
@@ -993,8 +1205,9 @@ class ManagerHandler(BaseHTTPRequestHandler):
             def run_async_refresh():
                 favs = get_all_favorites()
                 for f in favs:
-                    if "civitai." in f.get("url", ""):
-                        meta = fetch_civitai_meta(f["url"])
+                    target_url = f.get("url", "")
+                    if "civitai." in target_url:
+                        meta = fetch_civitai_meta(target_url)
                         if meta:
                             f["image_url"] = meta.get("image_url", f.get("image_url", ""))
                             f["filename"] = meta.get("filename", f.get("filename", ""))
@@ -1003,6 +1216,12 @@ class ManagerHandler(BaseHTTPRequestHandler):
                             if not f.get("name") or f["name"] == "Unnamed":
                                 f["name"] = meta.get("name", f["name"])
                             save_favorite(f)
+                    elif "huggingface.co" in target_url:
+                        parsed = parse_hf_url(target_url)
+                        if parsed and not f.get("filename"):
+                            f["filename"] = parsed["display_filename"]
+                            save_favorite(f)
+
             threading.Thread(target=run_async_refresh, daemon=True).start()
             self._send_json({"ok": True, "message": "Async refresh scheduled"})
 
@@ -1058,9 +1277,13 @@ class ManagerHandler(BaseHTTPRequestHandler):
             for folder in TARGET_DIRS.values():
                 if os.path.exists(folder):
                     for f in os.listdir(folder):
-                        if f.endswith((".aria2", ".crdownload", ".tmp")):
+                        if f.endswith((".aria2", ".crdownload", ".tmp")) or f.startswith(".tmp_"):
+                            full = os.path.join(folder, f)
                             try:
-                                os.remove(os.path.join(folder, f))
+                                if os.path.isdir(full):
+                                    shutil.rmtree(full, ignore_errors=True)
+                                else:
+                                    os.remove(full)
                                 cleaned += 1
                             except Exception:
                                 pass
@@ -1069,7 +1292,7 @@ class ManagerHandler(BaseHTTPRequestHandler):
         elif url.path == "/api/parse_workflow":
             wf_data = payload.get("workflow", {})
             text_str = json.dumps(wf_data)
-            matches = re.findall(r'[\w\-\s\.]+\.(?:safetensors|ckpt)', text_str, re.IGNORECASE)
+            matches = re.findall(r'[\w\-\s\.]+\.(?:safetensors|ckpt|pt|bin)', text_str, re.IGNORECASE)
             unique_matches = list(set(matches))
 
             installed_map = {}
@@ -1112,9 +1335,9 @@ class ManagerHandler(BaseHTTPRequestHandler):
 
         elif url.path == "/api/download":
             url_target = payload.get("url", "").strip()
-            category = payload.get("category", "lora")
+            category = payload.get("category", "loras")
             custom_name = payload.get("filename", "").strip()
-            dest_dir = TARGET_DIRS.get(category, TARGET_DIRS["lora"])
+            dest_dir = TARGET_DIRS.get(category, TARGET_DIRS["loras"])
 
             if custom_name and os.path.exists(os.path.join(dest_dir, custom_name)):
                 self._send_json({"task_id": None, "skipped": True, "message": "File already exists on disk"})
@@ -1123,11 +1346,26 @@ class ManagerHandler(BaseHTTPRequestHandler):
             hf_token = get_setting("hf_token", "")
             civitai_token = get_setting("civitai_token", "")
             task_id = str(len(download_tasks) + 1)
+
             is_civitai = "civitai." in url_target
+            is_hf = "huggingface.co" in url_target
 
             meta = payload.get("meta")
             if not meta and is_civitai:
                 meta = fetch_civitai_meta(url_target)
+
+            if is_hf:
+                download_type = "hf"
+                token = hf_token
+                hf_parsed = parse_hf_url(url_target)
+                if not custom_name and hf_parsed:
+                    custom_name = hf_parsed["display_filename"]
+            elif is_civitai:
+                download_type = "civitai"
+                token = civitai_token
+            else:
+                download_type = "aria2"
+                token = ""
 
             download_tasks[task_id] = {
                 "status": "Queued",
@@ -1147,9 +1385,9 @@ class ManagerHandler(BaseHTTPRequestHandler):
                 url_target,
                 dest_dir,
                 custom_name,
-                civitai_token if is_civitai else hf_token,
+                token,
                 meta,
-                is_civitai,
+                download_type,
                 False
             ))
 
@@ -1277,28 +1515,14 @@ class ManagerHandler(BaseHTTPRequestHandler):
         .meta-preview-box { display: flex; gap: 12px; align-items: center; background: #090d12; border: 1px solid var(--border); border-radius: 6px; padding: 10px; margin-bottom: 12px; }
         .meta-preview-img { width: 48px; height: 48px; border-radius: 4px; object-fit: cover; background: #161b22; flex-shrink: 0; }
 
-        .swal2-container.swal2-top-end.swal2-backdrop-hide,
-        .swal2-container.swal2-top-end { background: transparent !important; box-shadow: none !important; }
-        div:where(.swal2-container).swal2-toast { background: transparent !important; box-shadow: none !important; border: 0 !important; backdrop-filter: none !important; }
-        div:where(.swal2-container).swal2-toast .swal2-title { color: #fff !important; font-size: 13px !important; text-shadow: 0 2px 6px rgba(0,0,0,0.8); }
-
-        div:where(.swal2-container):not(.swal2-toast) { background: rgba(0,0,0,0.75) !important; }
-        div:where(.swal2-container):not(.swal2-toast) div:where(.swal2-popup) {
-            background: #161b22 !important; border: 1px solid var(--border) !important; color: var(--text) !important;
-            border-radius: 8px !important; overflow-x: hidden !important; padding: 24px !important; box-sizing: border-box !important;
-        }
-        div:where(.swal2-container):not(.swal2-toast) .swal2-title { color: var(--blue) !important; font-size: 18px !important; }
-        div:where(.swal2-container):not(.swal2-toast) .swal2-html-container { color: var(--text) !important; overflow: visible !important; margin: 12px 0 !important; text-align: left !important; }
-        .swal-form-input {
-            width: 100% !important; box-sizing: border-box !important; background: #090d12 !important;
-            border: 1px solid var(--border) !important; color: var(--text) !important; padding: 8px 12px !important;
-            border-radius: 6px !important; margin: 4px 0 12px 0 !important; font-size: 14px !important;
-        }
+        .hidden-categories { display: none; }
+        .btn-toggle-view { width: 100%; margin-top: 14px; background: #21262d; border: 1px solid var(--border); color: var(--blue); padding: 8px; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; }
+        .btn-toggle-view:hover { background: #30363d; }
     </style>
 </head>
 <body>
     <div class="header-bar">
-        <h2>⚡ Comfy-Xtra: Asset & Model Manager <span class="status-badge">MongoDB Atlas Synced</span></h2>
+        <h2>⚡ Comfy-Xtra: Model & Asset Manager <span class="status-badge">HF-Transfer + Mongo Atlas</span></h2>
         <div style="display:flex; gap:8px;">
             <button class="btn-outline btn-sm" onclick="purgeTempFiles()">🧹 Clean Temp / .aria2</button>
             <button class="btn-purple btn-sm" onclick="triggerComfyRefresh()">🔄 Refresh ComfyUI</button>
@@ -1321,10 +1545,10 @@ class ManagerHandler(BaseHTTPRequestHandler):
         <div>
             <div class="card">
                 <h3>🔑 Central API Keys & Webhooks</h3>
+                <label>HuggingFace Token (Read Token for gated / fast downloads)</label>
+                <input id="hf_token" type="password" placeholder="hf_...">
                 <label>Civitai API Token</label>
                 <input id="civitai_token" type="password" placeholder="Civitai API Key">
-                <label>HuggingFace Token</label>
-                <input id="hf_token" type="password" placeholder="hf_...">
                 <label>Discord Webhook URL</label>
                 <input id="discord_webhook" placeholder="https://discord.com/api/webhooks/...">
                 <button onclick="saveKeys()">Save Settings to Cloud DB</button>
@@ -1332,12 +1556,12 @@ class ManagerHandler(BaseHTTPRequestHandler):
 
             <div class="card">
                 <h3>📥 Direct Download</h3>
-                <label>Model Direct URL</label>
-                <input id="dl_url" placeholder="Paste direct URL (Civitai or HuggingFace)" oninput="handleDownloadUrlInput(this.value)">
+                <label>Model URL (HuggingFace, Civitai, or Direct)</label>
+                <input id="dl_url" placeholder="Paste URL (e.g. huggingface.co/... or civitai.com/...)" oninput="handleDownloadUrlInput(this.value)">
 
                 <label class="auto-check-row">
                     <input type="checkbox" id="auto_detect_chk" checked style="width:auto; margin:0;">
-                    <span>Auto-detect Model info & type via API</span>
+                    <span>Auto-detect Model info via Civitai / HF API</span>
                 </label>
 
                 <div id="dl_meta_preview" class="meta-preview-box" style="display:none;">
@@ -1348,15 +1572,10 @@ class ManagerHandler(BaseHTTPRequestHandler):
                     </div>
                 </div>
 
-                <label>Target Category</label>
-                <select id="dl_cat">
-                    <option value="lora">LoRA (/loras)</option>
-                    <option value="checkpoint">Checkpoints (/checkpoints)</option>
-                    <option value="vae">VAE (/vae)</option>
-                    <option value="controlnet">ControlNet (/controlnet)</option>
-                </select>
+                <label>Target Folder (/workspace/ComfyUI/models/)</label>
+                <select id="dl_cat"></select>
                 <label>Custom Filename (Optional)</label>
-                <input id="dl_name" placeholder="Auto-detected from API if empty">
+                <input id="dl_name" placeholder="Auto-detected from URL if empty">
                 <button onclick="startDownload()">Start Download</button>
 
                 <h4 style="margin-top:24px; color:var(--subtext);">⚡ Active Transfers (Concurrency: 2)</h4>
@@ -1381,7 +1600,7 @@ class ManagerHandler(BaseHTTPRequestHandler):
             <div class="card">
                 <h3>⭐ Save to Favorites</h3>
                 <label>Model Download URL</label>
-                <input id="fav_url" placeholder="Paste direct Civitai or HF URL" oninput="handleFavUrlInput(this.value)">
+                <input id="fav_url" placeholder="Paste Civitai or HuggingFace URL" oninput="handleFavUrlInput(this.value)">
 
                 <div id="fav_meta_preview" class="meta-preview-box" style="display:none;">
                     <img id="fav_meta_img" class="meta-preview-img">
@@ -1392,22 +1611,17 @@ class ManagerHandler(BaseHTTPRequestHandler):
                 </div>
 
                 <label>Display Name</label>
-                <input id="fav_name" placeholder="Auto-populated or enter custom name">
+                <input id="fav_name" placeholder="Auto-populated or custom name">
 
-                <label>Category</label>
-                <select id="fav_cat">
-                    <option value="lora">LoRA (/loras)</option>
-                    <option value="checkpoint">Checkpoint (/checkpoints)</option>
-                    <option value="vae">VAE (/vae)</option>
-                    <option value="controlnet">ControlNet (/controlnet)</option>
-                </select>
+                <label>Target Category</label>
+                <select id="fav_cat"></select>
 
                 <label class="auto-check-row" style="color:var(--amber);">
                     <input type="checkbox" id="fav_auto_install" style="width:auto; margin:0;">
                     <span>⚡ Load on Startup (Always install automatically if missing)</span>
                 </label>
 
-                <label>Assign to Groups (Checkmarks)</label>
+                <label>Assign to Groups</label>
                 <div id="group_checkboxes" class="checkbox-container">Loading groups...</div>
                 
                 <input type="hidden" id="fav_img">
@@ -1433,14 +1647,71 @@ class ManagerHandler(BaseHTTPRequestHandler):
             <div class="card">
                 <div style="display:flex; justify-content:space-between; align-items:center;">
                     <h3>📦 Installed Models in /workspace/ComfyUI</h3>
-                    <span style="font-size:12px; color:var(--subtext);">💡 Tip: Drag rows between categories to move files!</span>
+                    <span style="font-size:12px; color:var(--subtext);">💡 Tip: Drag rows between categories to move files</span>
                 </div>
-                <div id="model_tables">Loading models...</div>
+                <div id="model_tables_priority"></div>
+                <div id="model_tables_secondary" class="hidden-categories"></div>
+                <button id="toggle_models_btn" class="btn-toggle-view" onclick="toggleSecondaryModels()">▼ Show More Folders (All 27 Categories)</button>
             </div>
         </div>
     </div>
 
     <script>
+        const PRIORITY_CATS = [
+            "checkpoints", "loras", "unet", "diffusion_models", "clip", "vae", "controlnet", "upscale_models", "embeddings"
+        ];
+
+        const ALL_CATS = [
+            "checkpoints", "loras", "unet", "diffusion_models", "clip", "vae", "controlnet", "upscale_models", "embeddings",
+            "audio_encoders", "background_removal", "ckpt", "clip_vision", "configs", "detection", "diffusers",
+            "frame_interpolation", "geometry_estimation", "gligen", "hypernetworks", "latent_upscale_models",
+            "model_patches", "optical_flow", "photomaker", "style_models", "text_encoders", "vae_approx"
+        ];
+
+        function populateCategoryDropdown(elementId) {
+            const select = document.getElementById(elementId);
+            if (!select) return;
+            select.innerHTML = '';
+
+            const optGroupPri = document.createElement('optgroup');
+            optGroupPri.label = "⭐ Priority Categories";
+            PRIORITY_CATS.forEach(c => {
+                const opt = document.createElement('option');
+                opt.value = c;
+                opt.textContent = `${c} (/${c})`;
+                optGroupPri.appendChild(opt);
+            });
+            select.appendChild(optGroupPri);
+
+            const optGroupSec = document.createElement('optgroup');
+            optGroupSec.label = "📁 Other ComfyUI Folders";
+            ALL_CATS.filter(c => !PRIORITY_CATS.includes(c)).forEach(c => {
+                const opt = document.createElement('option');
+                opt.value = c;
+                opt.textContent = `${c} (/${c})`;
+                optGroupSec.appendChild(opt);
+            });
+            select.appendChild(optGroupSec);
+            select.value = "loras";
+        }
+
+        populateCategoryDropdown('dl_cat');
+        populateCategoryDropdown('fav_cat');
+
+        let showSecondary = false;
+        function toggleSecondaryModels() {
+            showSecondary = !showSecondary;
+            const sec = document.getElementById('model_tables_secondary');
+            const btn = document.getElementById('toggle_models_btn');
+            if (showSecondary) {
+                sec.style.display = 'block';
+                btn.innerText = "▲ Hide Secondary Folders";
+            } else {
+                sec.style.display = 'none';
+                btn.innerText = "▼ Show More Folders (All 27 Categories)";
+            }
+        }
+
         const Toast = Swal.mixin({
             toast: true,
             position: 'top-end',
@@ -1450,16 +1721,6 @@ class ManagerHandler(BaseHTTPRequestHandler):
             background: 'transparent',
             color: '#ffffff'
         });
-
-        if ("Notification" in window && Notification.permission !== "granted") {
-            Notification.requestPermission();
-        }
-
-        function sendBrowserNotification(title, body) {
-            if ("Notification" in window && Notification.permission === "granted") {
-                new Notification(title, { body: body, icon: "https://comfy.org/favicon.ico" });
-            }
-        }
 
         function copyTriggerWord(word) {
             navigator.clipboard.writeText(word);
@@ -1505,8 +1766,7 @@ class ManagerHandler(BaseHTTPRequestHandler):
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({ hf_token, civitai_token, discord_webhook })
             });
-            Toast.fire({ icon: 'success', title: 'Settings synced to MongoDB Atlas!' });
-            sendBrowserNotification("Comfy-Xtra", "Settings synchronized to MongoDB Atlas.");
+            Toast.fire({ icon: 'success', title: 'Settings saved & synced!' });
         }
 
         async function triggerComfyRefresh() {
@@ -1514,9 +1774,8 @@ class ManagerHandler(BaseHTTPRequestHandler):
             let data = await res.json();
             if(data.ok) {
                 Toast.fire({ icon: 'success', title: 'ComfyUI reloaded & VRAM freed!' });
-                sendBrowserNotification("ComfyUI Reloaded", "Model lists updated and unneeded VRAM freed.");
             } else {
-                Toast.fire({ icon: 'error', title: 'ComfyUI refresh ping failed.' });
+                Toast.fire({ icon: 'error', title: 'ComfyUI refresh failed.' });
             }
         }
 
@@ -1560,23 +1819,23 @@ class ManagerHandler(BaseHTTPRequestHandler):
         function handleDownloadUrlInput(val) {
             clearTimeout(dlProbeTimer);
             if (!document.getElementById('auto_detect_chk').checked) return;
-            if (!val.includes('civitai.')) {
+            if (!val.includes('civitai.') && !val.includes('huggingface.co')) {
                 document.getElementById('dl_meta_preview').style.display = 'none';
                 currentDetectedDlMeta = null;
                 return;
             }
             dlProbeTimer = setTimeout(async () => {
-                let res = await fetch(`/api/civitai_probe?url=${encodeURIComponent(val)}`);
+                let res = await fetch(`/api/probe?url=${encodeURIComponent(val)}`);
                 let meta = await res.json();
                 if (meta && !meta.error) {
                     currentDetectedDlMeta = meta;
-                    document.getElementById('dl_cat').value = meta.category;
-                    if (!document.getElementById('dl_name').value) {
+                    if (meta.category) document.getElementById('dl_cat').value = meta.category;
+                    if (!document.getElementById('dl_name').value && meta.filename) {
                         document.getElementById('dl_name').value = meta.filename;
                     }
                     document.getElementById('dl_meta_title').innerText = meta.name;
-                    let sz = (meta.total_bytes / (1024*1024)).toFixed(1);
-                    document.getElementById('dl_meta_details').innerText = `Type: ${meta.civitai_type} | Size: ${sz} MB | File: ${meta.filename}`;
+                    let sz = meta.total_bytes ? (meta.total_bytes / (1024*1024)).toFixed(1) + ' MB' : 'HF Fast Stream';
+                    document.getElementById('dl_meta_details').innerText = `Source: ${meta.source_type} | Size: ${sz} | File: ${meta.filename}`;
                     if (meta.image_url) {
                         document.getElementById('dl_meta_img').src = meta.image_url;
                         document.getElementById('dl_meta_img').style.display = 'block';
@@ -1585,31 +1844,31 @@ class ManagerHandler(BaseHTTPRequestHandler):
                     }
                     document.getElementById('dl_meta_preview').style.display = 'flex';
                 }
-            }, 450);
+            }, 400);
         }
 
         function handleFavUrlInput(val) {
             clearTimeout(favProbeTimer);
-            if (!val.includes('civitai.')) {
+            if (!val.includes('civitai.') && !val.includes('huggingface.co')) {
                 document.getElementById('fav_meta_preview').style.display = 'none';
                 return;
             }
             favProbeTimer = setTimeout(async () => {
-                let res = await fetch(`/api/civitai_probe?url=${encodeURIComponent(val)}`);
+                let res = await fetch(`/api/probe?url=${encodeURIComponent(val)}`);
                 let meta = await res.json();
                 if (meta && !meta.error) {
                     if (!document.getElementById('fav_name').value) {
                         document.getElementById('fav_name').value = meta.name;
                     }
-                    document.getElementById('fav_cat').value = meta.category;
+                    if (meta.category) document.getElementById('fav_cat').value = meta.category;
                     document.getElementById('fav_img').value = meta.image_url || '';
                     document.getElementById('fav_filename').value = meta.filename || '';
                     document.getElementById('fav_bytes').value = meta.total_bytes || 0;
                     document.getElementById('fav_tw').value = JSON.stringify(meta.trained_words || []);
 
                     document.getElementById('fav_meta_title').innerText = meta.name;
-                    let sz = (meta.total_bytes / (1024*1024)).toFixed(1);
-                    document.getElementById('fav_meta_details').innerText = `Type: ${meta.civitai_type} | Size: ${sz} MB | File: ${meta.filename}`;
+                    let sz = meta.total_bytes ? (meta.total_bytes / (1024*1024)).toFixed(1) + ' MB' : 'HF Fast Stream';
+                    document.getElementById('fav_meta_details').innerText = `Source: ${meta.source_type} | Size: ${sz} | File: ${meta.filename}`;
                     if (meta.image_url) {
                         document.getElementById('fav_meta_img').src = meta.image_url;
                         document.getElementById('fav_meta_img').style.display = 'block';
@@ -1618,7 +1877,7 @@ class ManagerHandler(BaseHTTPRequestHandler):
                     }
                     document.getElementById('fav_meta_preview').style.display = 'flex';
                 }
-            }, 450);
+            }, 400);
         }
 
         let cachedGroups = [];
@@ -1670,10 +1929,10 @@ class ManagerHandler(BaseHTTPRequestHandler):
                 html: `
                     <div>
                         <label>Group Name</label>
-                        <input id="swal_group_name" class="swal-form-input" placeholder="e.g. SDXL Inpainting">
+                        <input id="swal_group_name" style="width:100%; box-sizing:border-box; background:#090d12; border:1px solid var(--border); color:#fff; padding:8px; border-radius:6px; margin-bottom:12px;" placeholder="e.g. Flux Dev / Inpaint">
                         <label>Emoji Icon</label>
-                        <input id="swal_group_emoji" class="swal-form-input" value="📁">
-                        <div style="margin-top:6px;">${emojiButtons}</div>
+                        <input id="swal_group_emoji" style="width:100%; box-sizing:border-box; background:#090d12; border:1px solid var(--border); color:#fff; padding:8px; border-radius:6px; margin-bottom:8px;" value="📁">
+                        <div>${emojiButtons}</div>
                     </div>`,
                 focusConfirm: false,
                 showCancelButton: true,
@@ -1709,10 +1968,10 @@ class ManagerHandler(BaseHTTPRequestHandler):
                 html: `
                     <div>
                         <label>Group Name</label>
-                        <input id="swal_group_name" class="swal-form-input" value="${g.name}">
+                        <input id="swal_group_name" style="width:100%; box-sizing:border-box; background:#090d12; border:1px solid var(--border); color:#fff; padding:8px; border-radius:6px; margin-bottom:12px;" value="${g.name}">
                         <label>Emoji Icon</label>
-                        <input id="swal_group_emoji" class="swal-form-input" value="${g.emoji}">
-                        <div style="margin-top:6px;">${emojiButtons}</div>
+                        <input id="swal_group_emoji" style="width:100%; box-sizing:border-box; background:#090d12; border:1px solid var(--border); color:#fff; padding:8px; border-radius:6px; margin-bottom:8px;" value="${g.emoji}">
+                        <div>${emojiButtons}</div>
                     </div>`,
                 showDenyButton: true,
                 showCancelButton: true,
@@ -1741,7 +2000,7 @@ class ManagerHandler(BaseHTTPRequestHandler):
             } else if (formValues === false) {
                 let confirmDel = await Swal.fire({
                     title: `Delete "${g.name}"?`,
-                    text: 'Models in this group will not be deleted.',
+                    text: 'Models in this group will remain in storage.',
                     icon: 'warning',
                     showCancelButton: true,
                     confirmButtonColor: '#f85149',
@@ -1838,23 +2097,20 @@ class ManagerHandler(BaseHTTPRequestHandler):
 
             let twString = (fav.trained_words || []).join(', ');
 
+            let catOptions = ALL_CATS.map(c => `<option value="${c}" ${fav.category === c ? 'selected' : ''}>${c}</option>`).join('');
+
             let { value: formValues } = await Swal.fire({
                 title: 'Edit Favorite Model',
                 html: `
                     <div>
                         <label>Display Name</label>
-                        <input id="edit_fav_name" class="swal-form-input" value="${fav.name}">
+                        <input id="edit_fav_name" style="width:100%; box-sizing:border-box; background:#090d12; border:1px solid var(--border); color:#fff; padding:8px; border-radius:6px; margin-bottom:8px;" value="${fav.name}">
                         <label>Download URL</label>
-                        <input id="edit_fav_url" class="swal-form-input" value="${fav.url}">
+                        <input id="edit_fav_url" style="width:100%; box-sizing:border-box; background:#090d12; border:1px solid var(--border); color:#fff; padding:8px; border-radius:6px; margin-bottom:8px;" value="${fav.url}">
                         <label>Target Category</label>
-                        <select id="edit_fav_cat" class="swal-form-input">
-                            <option value="lora" ${fav.category === 'lora' ? 'selected' : ''}>LoRA</option>
-                            <option value="checkpoint" ${fav.category === 'checkpoint' ? 'selected' : ''}>Checkpoint</option>
-                            <option value="vae" ${fav.category === 'vae' ? 'selected' : ''}>VAE</option>
-                            <option value="controlnet" ${fav.category === 'controlnet' ? 'selected' : ''}>ControlNet</option>
-                        </select>
+                        <select id="edit_fav_cat" style="width:100%; box-sizing:border-box; background:#090d12; border:1px solid var(--border); color:#fff; padding:8px; border-radius:6px; margin-bottom:8px;">${catOptions}</select>
                         <label>Trained Trigger Words (Comma-separated)</label>
-                        <input id="edit_fav_tw" class="swal-form-input" value="${twString}">
+                        <input id="edit_fav_tw" style="width:100%; box-sizing:border-box; background:#090d12; border:1px solid var(--border); color:#fff; padding:8px; border-radius:6px; margin-bottom:8px;" value="${twString}">
                         <label class="auto-check-row" style="color:var(--amber); margin-top:8px;">
                             <input type="checkbox" id="edit_fav_autoinstall" ${fav.auto_install ? 'checked' : ''} style="width:auto; margin:0;">
                             <span>⚡ Load on Startup</span>
@@ -1901,7 +2157,6 @@ class ManagerHandler(BaseHTTPRequestHandler):
                 icon: 'question',
                 showCancelButton: true,
                 confirmButtonColor: '#f85149',
-                cancelButtonColor: '#30363d',
                 confirmButtonText: 'Yes, delete'
             });
 
@@ -1991,7 +2246,6 @@ class ManagerHandler(BaseHTTPRequestHandler):
             }
 
             let html = '';
-
             for (let gid in groupedBuckets) {
                 let g = groupMap[gid] || { name: 'Unknown Group', emoji: '📁' };
                 let items = groupedBuckets[gid];
@@ -2037,7 +2291,6 @@ class ManagerHandler(BaseHTTPRequestHandler):
                 await startDownload(item.url, item.category, item.filename || '');
             }
             Toast.fire({ icon: 'success', title: `Queued ${items.length} items from ${g ? g.name : 'Group'}` });
-            sendBrowserNotification("Group Queued", `Queued ${items.length} items from ${g ? g.name : 'Group'}`);
         }
 
         async function installAllFavorites() {
@@ -2047,7 +2300,6 @@ class ManagerHandler(BaseHTTPRequestHandler):
                 icon: 'question',
                 showCancelButton: true,
                 confirmButtonColor: '#238636',
-                cancelButtonColor: '#30363d',
                 confirmButtonText: 'Yes, install all'
             });
 
@@ -2056,7 +2308,6 @@ class ManagerHandler(BaseHTTPRequestHandler):
                     await startDownload(item.url, item.category, item.filename || '');
                 }
                 Toast.fire({ icon: 'success', title: `Queued all ${cachedFavs.length} favorites!` });
-                sendBrowserNotification("Batch Queued", `Queued all ${cachedFavs.length} favorites.`);
             }
         }
 
@@ -2106,7 +2357,6 @@ class ManagerHandler(BaseHTTPRequestHandler):
                 icon: 'warning',
                 showCancelButton: true,
                 confirmButtonColor: '#f85149',
-                cancelButtonColor: '#30363d',
                 confirmButtonText: 'Yes, cancel it'
             });
 
@@ -2175,9 +2425,9 @@ class ManagerHandler(BaseHTTPRequestHandler):
                 html: `
                     <div>
                         <label>Current Filename in /${category}</label>
-                        <input class="swal-form-input" value="${oldFilename}" disabled style="opacity:0.6;">
+                        <input style="width:100%; box-sizing:border-box; background:#090d12; border:1px solid var(--border); color:#fff; padding:8px; border-radius:6px; margin-bottom:8px; opacity:0.6;" value="${oldFilename}" disabled>
                         <label>New Filename</label>
-                        <input id="swal_rename_input" class="swal-form-input" value="${oldFilename}">
+                        <input id="swal_rename_input" style="width:100%; box-sizing:border-box; background:#090d12; border:1px solid var(--border); color:#fff; padding:8px; border-radius:6px;" value="${oldFilename}">
                     </div>`,
                 showCancelButton: true,
                 confirmButtonColor: '#238636',
@@ -2211,7 +2461,6 @@ class ManagerHandler(BaseHTTPRequestHandler):
                 icon: 'warning',
                 showCancelButton: true,
                 confirmButtonColor: '#f85149',
-                cancelButtonColor: '#30363d',
                 confirmButtonText: 'Delete file'
             });
 
@@ -2227,38 +2476,52 @@ class ManagerHandler(BaseHTTPRequestHandler):
             }
         }
 
+        function renderCategoryBlock(cat, files) {
+            let html = `
+            <div id="drop_target_${cat}" class="drag-table-wrap" 
+                 ondragover="handleDragOver(event, '${cat}')" 
+                 ondragleave="handleDragLeave(event, '${cat}')" 
+                 ondrop="handleDrop(event, '${cat}')">
+                <h4 style="margin-top:16px;">${cat.toUpperCase()} (${files.length})</h4>`;
+
+            if(files.length === 0) {
+                html += '<p style="color:var(--subtext); font-size:12px; margin:4px 0 14px 0;">No files (Drag models here to move)</p>';
+            } else {
+                html += '<table><thead><tr><th>Name</th><th>Size</th><th>Action</th></tr></thead><tbody>';
+                files.forEach(m => {
+                    html += `
+                    <tr class="draggable-row" draggable="true" ondragstart="handleDragStart(event, '${cat}', '${m.name.replace(/'/g, "\\'")}')">
+                        <td><strong>⠿ ${m.name}</strong></td>
+                        <td>${m.size}</td>
+                        <td>
+                            <button class="btn-sm btn-outline" onclick="renameModel('${cat}', '${m.name.replace(/'/g, "\\'")}')">Rename</button>
+                            <button class="del" onclick="deleteModel('${cat}', '${m.name.replace(/'/g, "\\'")}')">Delete</button>
+                        </td>
+                    </tr>`;
+                });
+                html += '</tbody></table>';
+            }
+            html += '</div>';
+            return html;
+        }
+
         async function refreshModels() {
             let res = await fetch('/api/models');
             let data = await res.json();
-            let html = '';
-            for (let cat in data) {
-                html += `
-                <div id="drop_target_${cat}" class="drag-table-wrap" 
-                     ondragover="handleDragOver(event, '${cat}')" 
-                     ondragleave="handleDragLeave(event, '${cat}')" 
-                     ondrop="handleDrop(event, '${cat}')">
-                    <h4 style="margin-top:16px;">${cat.toUpperCase()} (${data[cat].length})</h4>`;
+            
+            let priHtml = '';
+            let secHtml = '';
 
-                if(data[cat].length === 0) {
-                    html += '<p style="color:var(--subtext); font-size:13px; margin:4px 0 16px 0;">No files (Drag models here to move)</p>';
-                } else {
-                    html += '<table><thead><tr><th>Name</th><th>Size</th><th>Action</th></tr></thead><tbody>';
-                    data[cat].forEach(m => {
-                        html += `
-                        <tr class="draggable-row" draggable="true" ondragstart="handleDragStart(event, '${cat}', '${m.name.replace(/'/g, "\\'")}')">
-                            <td><strong>⠿ ${m.name}</strong></td>
-                            <td>${m.size}</td>
-                            <td>
-                                <button class="btn-sm btn-outline" onclick="renameModel('${cat}', '${m.name.replace(/'/g, "\\'")}')">Rename</button>
-                                <button class="del" onclick="deleteModel('${cat}', '${m.name.replace(/'/g, "\\'")}')">Delete</button>
-                            </td>
-                        </tr>`;
-                    });
-                    html += '</tbody></table>';
-                }
-                html += '</div>';
-            }
-            document.getElementById('model_tables').innerHTML = html;
+            PRIORITY_CATS.forEach(cat => {
+                priHtml += renderCategoryBlock(cat, data[cat] || []);
+            });
+
+            ALL_CATS.filter(c => !PRIORITY_CATS.includes(c)).forEach(cat => {
+                secHtml += renderCategoryBlock(cat, data[cat] || []);
+            });
+
+            document.getElementById('model_tables_priority').innerHTML = priHtml;
+            document.getElementById('model_tables_secondary').innerHTML = secHtml;
         }
 
         let completedNotified = new Set();
@@ -2285,7 +2548,6 @@ class ManagerHandler(BaseHTTPRequestHandler):
                 if (isDone && !completedNotified.has(id)) {
                     completedNotified.add(id);
                     Toast.fire({ icon: 'success', title: `Completed: ${t.file}` });
-                    sendBrowserNotification("Download Ready! 🎉", `${t.file} finished downloading.`);
                     refreshModels();
                     updateDiskSpace();
                 }
@@ -2355,17 +2617,17 @@ command=${PYTHON_BIN} /opt/x-dashboard.py
 autostart=true
 autorestart=true
 startretries=5
-environment=MONGO_URI="${RESOLVED_MONGO_URI}"
+environment=MONGO_URI="${RESOLVED_MONGO_URI}",HF_HUB_ENABLE_HF_TRANSFER="1"
 stderr_logfile=/var/log/supervisor/comfy-xtra.err.log
 stdout_logfile=/var/log/supervisor/comfy-xtra.out.log
 EOF
 
-# Release port 17890 if occupied
+# Release port 17890 if already bound
 if command -v fuser >/dev/null 2>&1; then
     fuser -k 17890/tcp || true
 fi
 
-# Ensure supervisor daemon is running before supervisorctl commands
+# Ensure supervisor daemon is running
 if ! pgrep -x "supervisord" >/dev/null 2>&1; then
     if [ -f "/etc/supervisor/supervisord.conf" ]; then
         supervisord -c /etc/supervisor/supervisord.conf
@@ -2394,7 +2656,7 @@ done
 
 if [ "${READY}" -eq 1 ]; then
     echo "============================================================"
-    echo " SUCCESS: Comfy-Xtra Boot Alert & Env Sync Active on 17890! "
+    echo " SUCCESS: Comfy-Xtra Online with HF-Transfer on Port 17890! "
     echo "============================================================"
 else
     echo "ERROR: Healthcheck timed out. Displaying supervisor logs:"
