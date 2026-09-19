@@ -1,14 +1,20 @@
 #!/bin/bash
 set -Eeuo pipefail
 
+# --- Pre-flight Shell & Environment Safeguards ---
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+export UCF_FORCE_CONFFOLD=1
+
 LOG_FILE="/var/log/provisioning_comfy_xtra.log"
+mkdir -p "$(dirname "${LOG_FILE}")"
 exec > >(tee -a "${LOG_FILE}") 2>&1
 
 echo "============================================================"
 echo " [1/6] Launching Automated Comfy-Xtra Provisioning Script    "
 echo "============================================================"
 
-# --- 1. Retry Function for Network & Package Installs ---
+# --- 1. Robust Retry Function for Headless Packages & Networks ---
 run_with_retry() {
     local cmd="$1"
     local max_attempts="${2:-5}"
@@ -17,9 +23,16 @@ run_with_retry() {
 
     while [ "${attempt}" -le "${max_attempts}" ]; do
         echo "--> Executing: ${cmd} (Attempt ${attempt}/${max_attempts})"
+        
+        # Clear any interrupted dpkg configuration state before running
+        if [[ "${cmd}" == *"apt"* ]] || [[ "${cmd}" == *"dpkg"* ]]; then
+            dpkg --configure -a 2>/dev/null || true
+        fi
+
         if eval "${cmd}"; then
             return 0
         fi
+
         echo "WARN: Command failed. Retrying in ${delay}s..."
         sleep "${delay}"
         attempt=$((attempt + 1))
@@ -30,16 +43,21 @@ run_with_retry() {
     return 1
 }
 
-# --- 2. Install System Dependencies ---
+# --- 2. Install System Dependencies (Unattended & Lock-Safe) ---
 echo "=== [2/6] Verifying System Dependencies ==="
+APT_OPTS="-y --no-install-recommends -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"
+
 run_with_retry "apt-get update" 3 3
-run_with_retry "apt-get install -y --no-install-recommends aria2 ca-certificates psmisc curl jq supervisor" 5 5
+run_with_retry "apt-get install ${APT_OPTS} aria2 ca-certificates psmisc curl jq supervisor" 5 5
 
 # --- 3. Resolve Python & Install Required Wheels ---
 echo "=== [3/6] Resolving Python & Installing pymongo ==="
 if [ -f "/venv/main/bin/python" ]; then
     PYTHON_BIN="/venv/main/bin/python"
     PIP_BIN="/venv/main/bin/pip"
+elif [ -f "/opt/conda/bin/python" ]; then
+    PYTHON_BIN="/opt/conda/bin/python"
+    PIP_BIN="/opt/conda/bin/pip"
 elif command -v python3 >/dev/null 2>&1; then
     PYTHON_BIN="$(command -v python3)"
     PIP_BIN="$(command -v pip3 || command -v pip)"
@@ -66,6 +84,7 @@ mkdir -p "${COMFY_BASE}/checkpoints" \
 # Capture existing environment Mongo URI into /etc/environment if present
 RESOLVED_MONGO_URI="${MONGO_URI:-${MONGODB_URI:-${MONGO_URL:-}}}"
 if [ -n "${RESOLVED_MONGO_URI}" ]; then
+    sed -i '/^MONGO_URI=/d' /etc/environment 2>/dev/null || true
     echo "MONGO_URI=\"${RESOLVED_MONGO_URI}\"" >> /etc/environment
 fi
 
@@ -2350,6 +2369,8 @@ fi
 if ! pgrep -x "supervisord" >/dev/null 2>&1; then
     if [ -f "/etc/supervisor/supervisord.conf" ]; then
         supervisord -c /etc/supervisor/supervisord.conf
+    elif [ -f "/etc/supervisord.conf" ]; then
+        supervisord -c /etc/supervisord.conf
     else
         supervisord
     fi
