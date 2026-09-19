@@ -1,5 +1,14 @@
-#!/usr/bin/env bash
-set -eo pipefail
+#!/bin/sh
+# Safe POSIX entrypoint compatible with cloud template runners (/bin/sh and /bin/bash)
+set -e
+
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+
+# Stage background provisioner payload to /tmp
+cat <<'PROV_EOF' > /tmp/run_comfy_xtra_provision.sh
+#!/bin/bash
+# Do NOT exit on non-critical network / package warnings
+set +e
 
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
@@ -9,29 +18,34 @@ export HF_HUB_ENABLE_HF_TRANSFER=1
 
 LOG_FILE="/var/log/provisioning_comfy_xtra.log"
 mkdir -p "$(dirname "${LOG_FILE}")"
+exec >> "${LOG_FILE}" 2>&1
 
-# Read environment variables
+echo "============================================================"
+echo " Starting Comfy-Xtra Provisioning Pipeline                  "
+echo "============================================================"
+
+# Resolve Database & Discord Webhooks safely without triggering exit 1
 RESOLVED_MONGO_URI="${MONGO_URI:-${MONGODB_URI:-${MONGO_URL:-}}}"
 DISCORD_URL="${DISCORD_WEBHOOK:-${DISCORD_WEBHOOK_URL:-}}"
 
-# Fallback: check /etc/environment if not in subshell env
 if [ -z "${DISCORD_URL}" ] && [ -f "/etc/environment" ]; then
-    DISCORD_URL=$(grep -E '^(DISCORD_WEBHOOK|DISCORD_WEBHOOK_URL)=' /etc/environment | head -n 1 | cut -d'=' -f2- | tr -d '"'\''')
+    DISCORD_URL=$(grep -E '^(DISCORD_WEBHOOK|DISCORD_WEBHOOK_URL)=' /etc/environment 2>/dev/null | head -n 1 | cut -d'=' -f2- | tr -d '"'\''' || true)
 fi
 
-# 1. Send Immediate Startup Webhook
-if [ -n "${DISCORD_URL}" ]; then
-    HOSTNAME_VAL=$(hostname 2>/dev/null || echo "Unknown Container")
-    curl -s -X POST "${DISCORD_URL}" \
-        -H "Content-Type: application/json" \
-        -d "{\"embeds\":[{\"title\":\"⚙️ Provisioning Started\",\"description\":\"The Comfy-Xtra provisioning script has started on host \`${HOSTNAME_VAL}\`.\",\"color\":3447003,\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}]}" >/dev/null 2>&1 || true
-fi
+send_discord() {
+    local title="$1"
+    local desc="$2"
+    local color="${3:-3447003}"
+    if [ -n "${DISCORD_URL}" ]; then
+        curl -s -X POST "${DISCORD_URL}" \
+            -H "Content-Type: application/json" \
+            -d "{\"embeds\":[{\"title\":\"${title}\",\"description\":\"${desc}\",\"color\":${color},\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}]}" >/dev/null 2>&1 || true
+    fi
+}
 
-echo "============================================================"
-echo " [1/5] Launching Comfy-Xtra Provisioning                     "
-echo "============================================================"
+send_discord "⚙️ Provisioning Started" "Comfy-Xtra setup started on \`$(hostname)\`." 3447003
 
-# 2. Resolve Python & Pip
+# 1. Resolve Python Binary
 if [ -f "/venv/main/bin/python" ]; then
     PYTHON_BIN="/venv/main/bin/python"
     PIP_BIN="/venv/main/bin/pip"
@@ -42,24 +56,29 @@ elif command -v python3 >/dev/null 2>&1; then
     PYTHON_BIN="$(command -v python3)"
     PIP_BIN="$(command -v pip3 || command -v pip)"
 else
-    echo "FATAL: No suitable Python binary found."
+    send_discord "❌ Provisioning Failed" "No suitable Python environment discovered." 15158332
     exit 1
 fi
 
 echo "Using Python: ${PYTHON_BIN}"
+echo "Using Pip:    ${PIP_BIN}"
 
-# 3. Clear Package Locks & Install Base Tools
-killall -9 apt-get apt dpkg 2>/dev/null || true
-rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock* 2>/dev/null || true
-dpkg --configure -a 2>/dev/null || true
+# 2. Wait for system cloud apt locks to release
+for i in {1..30}; do
+    if ! fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 && ! fuser /var/lib/apt/lists/lock >/dev/null 2>&1; then
+        break
+    fi
+    sleep 2
+done
 
-apt-get update -y
-apt-get install -y --no-install-recommends aria2 ca-certificates curl jq psmisc
+# 3. Base Utilities
+apt-get update -y || true
+apt-get install -y --no-install-recommends aria2 ca-certificates curl jq psmisc || true
 
-# Install Python packages including hf_transfer accelerator
-"${PIP_BIN}" install --no-cache-dir certifi 'pymongo[srv]' 'huggingface_hub[hf_transfer]'
+# 4. Pip Wheels (including hf_transfer turbo engine)
+"${PIP_BIN}" install --no-cache-dir certifi 'pymongo[srv]' 'huggingface_hub[hf_transfer]' || true
 
-# 4. Create ComfyUI Model Directories
+# 5. Scaffold all 27 ComfyUI Model Directories
 COMFY_BASE="/workspace/ComfyUI/models"
 ALL_DIRS=(
     "audio_encoders" "background_removal" "checkpoints" "ckpt" "clip" "clip_vision"
@@ -73,7 +92,7 @@ for folder in "${ALL_DIRS[@]}"; do
     mkdir -p "${COMFY_BASE}/${folder}"
 done
 
-# Save Mongo URI & Discord Webhook to /etc/environment for persistence
+# Persist environment variables
 if [ -n "${RESOLVED_MONGO_URI}" ]; then
     sed -i '/^MONGO_URI=/d' /etc/environment 2>/dev/null || true
     echo "MONGO_URI=\"${RESOLVED_MONGO_URI}\"" >> /etc/environment
@@ -83,9 +102,8 @@ if [ -n "${DISCORD_URL}" ]; then
     echo "DISCORD_WEBHOOK=\"${DISCORD_URL}\"" >> /etc/environment
 fi
 
-# 5. Deploy /opt/x-dashboard.py
-echo "=== Writing Comfy-Xtra Application ==="
-cat <<'EOF' > /opt/x-dashboard.py
+# 6. Deploy /opt/x-dashboard.py
+cat <<'PY_EOF' > /opt/x-dashboard.py
 import os
 import re
 import sys
@@ -104,7 +122,6 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pymongo import MongoClient
 from pymongo.server_api import ServerApi
 
-# MongoDB & Discord Environment Configuration
 MONGO_URI = (
     os.environ.get("MONGO_URI") or 
     os.environ.get("MONGODB_URI") or 
@@ -149,7 +166,6 @@ TARGET_DIRS = {cat: os.path.join(COMFY_BASE, cat) for cat in ALL_CATEGORIES}
 for folder in TARGET_DIRS.values():
     os.makedirs(folder, exist_ok=True)
 
-# ----------------- Database Layer -----------------
 mongo_client = None
 
 def get_mongo_db():
@@ -164,8 +180,7 @@ def get_mongo_db():
                 server_api=ServerApi('1'),
                 serverSelectionTimeoutMS=4000
             )
-        except Exception as e:
-            print(f"[WARN] MongoClient failed: {e}", flush=True)
+        except Exception:
             return None
     return mongo_client[DB_NAME]
 
@@ -201,7 +216,6 @@ init_local_db()
 def get_setting(key, default=""):
     if key == "discord_webhook" and DISCORD_WEBHOOK_ENV:
         default = DISCORD_WEBHOOK_ENV
-
     db = get_mongo_db()
     if db is not None:
         try:
@@ -211,7 +225,6 @@ def get_setting(key, default=""):
                 return doc["value"]
         except Exception:
             pass
-
     try:
         with sqlite3.connect(LOCAL_DB_PATH) as conn:
             row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
@@ -236,7 +249,6 @@ def get_all_settings():
                 return settings
         except Exception:
             pass
-
     try:
         with sqlite3.connect(LOCAL_DB_PATH) as conn:
             rows = conn.execute("SELECT key, value FROM settings").fetchall()
@@ -244,7 +256,6 @@ def get_all_settings():
                 settings[k] = v
     except Exception:
         pass
-
     if "discord_webhook" not in settings and DISCORD_WEBHOOK_ENV:
         settings["discord_webhook"] = DISCORD_WEBHOOK_ENV
     return settings
@@ -256,22 +267,20 @@ def save_settings(data_dict):
             col = db[SETTINGS_COL]
             for k, v in data_dict.items():
                 col.update_one({"key": k}, {"$set": {"key": k, "value": v}}, upsert=True)
-        except Exception as e:
-            print(f"[ERROR] Mongo Save: {e}", flush=True)
-
+        except Exception:
+            pass
     try:
         with sqlite3.connect(LOCAL_DB_PATH) as conn:
             for k, v in data_dict.items():
                 conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (k, v))
             conn.commit()
-    except Exception as e:
-        print(f"[ERROR] SQLite Save: {e}", flush=True)
+    except Exception:
+        pass
 
 def send_discord_notification(title, description, color=0x238636, thumbnail_url=None, fields=None):
     webhook_url = get_setting("discord_webhook", "").strip()
     if not webhook_url or not webhook_url.startswith("http"):
         return
-
     embed = {
         "title": title,
         "description": description,
@@ -283,22 +292,17 @@ def send_discord_notification(title, description, color=0x238636, thumbnail_url=
         embed["thumbnail"] = {"url": thumbnail_url}
     if fields:
         embed["fields"] = fields
-
     payload = json.dumps({"embeds": [embed]}).encode("utf-8")
     try:
         req = urllib.request.Request(
             webhook_url,
             data=payload,
-            headers={
-                "Content-Type": "application/json",
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-            }
+            headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
         )
         urllib.request.urlopen(req, timeout=5)
-    except Exception as e:
-        print(f"[WARN] Webhook delivery failed: {e}", flush=True)
+    except Exception:
+        pass
 
-# Groups Helpers
 def get_all_groups():
     groups = []
     db = get_mongo_db()
@@ -315,7 +319,6 @@ def get_all_groups():
                 return groups
         except Exception:
             pass
-
     try:
         with sqlite3.connect(LOCAL_DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
@@ -331,7 +334,6 @@ def save_group(item):
     name = item.get("name", "").strip() or "Unnamed Group"
     emoji = item.get("emoji", "").strip() or "📁"
     payload = {"id": gid, "name": name, "emoji": emoji}
-
     db = get_mongo_db()
     if db is not None:
         try:
@@ -339,11 +341,9 @@ def save_group(item):
             col.update_one({"id": gid}, {"$set": payload}, upsert=True)
         except Exception:
             pass
-
     try:
         with sqlite3.connect(LOCAL_DB_PATH) as conn:
-            conn.execute("INSERT OR REPLACE INTO groups (id, name, emoji) VALUES (?, ?, ?)",
-                         (gid, name, emoji))
+            conn.execute("INSERT OR REPLACE INTO groups (id, name, emoji) VALUES (?, ?, ?)", (gid, name, emoji))
             conn.commit()
     except Exception:
         pass
@@ -359,7 +359,6 @@ def delete_group(gid):
             fav_col.update_many({"group_ids": gid}, {"$pull": {"group_ids": gid}})
         except Exception:
             pass
-
     try:
         with sqlite3.connect(LOCAL_DB_PATH) as conn:
             conn.execute("DELETE FROM groups WHERE id=?", (gid,))
@@ -367,30 +366,24 @@ def delete_group(gid):
     except Exception:
         pass
 
-# URL Parsing & Metadata Handlers
 def fetch_civitai_meta(url_or_id):
     token = get_setting("civitai_token", "")
     target = url_or_id.strip()
-
     m_param = re.search(r'[?&]modelVersionId=(\d+)', target, re.IGNORECASE)
     m_path = re.search(r'(?:models|model-versions)/(\d+)', target)
     vid = m_param.group(1) if m_param else (m_path.group(1) if m_path else target)
-
     if not str(vid).isdigit():
         return None
-
     api_url = f"https://civitai.com/api/v1/model-versions/{vid}"
-    req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+    req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
     if token:
         req.add_header("Authorization", f"Bearer {token.strip()}")
-
     try:
         with urllib.request.urlopen(req, timeout=8) as resp:
             if resp.status == 200:
                 data = json.loads(resp.read().decode("utf-8"))
                 model_info = data.get("model", {})
                 m_type = (model_info.get("type") or "LORA").upper()
-
                 cat_map = {
                     "CHECKPOINT": "checkpoints",
                     "LORA": "loras",
@@ -401,18 +394,15 @@ def fetch_civitai_meta(url_or_id):
                     "TEXTUALINVERSION": "embeddings"
                 }
                 mapped_cat = cat_map.get(m_type, "loras")
-
                 files = data.get("files", [])
                 primary_file = next((f for f in files if f.get("primary")), files[0] if files else {})
                 file_name = primary_file.get("name") or f"{data.get('name', 'model')}.safetensors"
                 size_kb = primary_file.get("sizeKB", 0)
                 total_bytes = int(size_kb * 1024)
-
                 images = data.get("images", [])
                 img_url = images[0].get("url") if images else ""
                 disp_name = f"{model_info.get('name', '')} - {data.get('name', '')}".strip(" -")
                 trained_words = data.get("trainedWords", [])
-
                 return {
                     "id": data.get("id"),
                     "name": disp_name or file_name,
@@ -444,7 +434,6 @@ def parse_hf_url(target_url):
         }
     return None
 
-# Favorites Helpers
 def get_all_favorites():
     favs = []
     db = get_mongo_db()
@@ -459,13 +448,11 @@ def get_all_favorites():
                     clean_gids = [g.strip() for g in gids.split(",") if g.strip()]
                 else:
                     clean_gids = []
-
                 t_words = doc.get("trained_words")
                 if isinstance(t_words, str):
                     t_words = json.loads(t_words) if t_words.startswith("[") else [w.strip() for w in t_words.split(",") if w.strip()]
                 elif not isinstance(t_words, list):
                     t_words = []
-
                 favs.append({
                     "id": str(doc.get("id") or doc.get("_id")),
                     "name": doc.get("name", "Unnamed"),
@@ -482,7 +469,6 @@ def get_all_favorites():
                 return favs
         except Exception:
             pass
-
     try:
         with sqlite3.connect(LOCAL_DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
@@ -495,7 +481,6 @@ def get_all_favorites():
                     t_words = json.loads(raw_tw) if raw_tw.startswith("[") else [w.strip() for w in raw_tw.split(",") if w.strip()]
                 except Exception:
                     t_words = []
-
                 favs.append({
                     "id": r["id"],
                     "name": r["name"],
@@ -517,7 +502,6 @@ def save_favorite(item):
     gids = item.get("group_ids", [])
     if isinstance(gids, str):
         gids = [g.strip() for g in gids.split(",") if g.strip()]
-
     url = item.get("url", "").strip()
     name = item.get("name", "").strip()
     category = item.get("category", "loras")
@@ -556,7 +540,6 @@ def save_favorite(item):
         "trained_words": trained_words,
         "auto_install": auto_install
     }
-
     db = get_mongo_db()
     if db is not None:
         try:
@@ -564,7 +547,6 @@ def save_favorite(item):
             col.update_one({"id": fav_id}, {"$set": payload}, upsert=True)
         except Exception:
             pass
-
     try:
         with sqlite3.connect(LOCAL_DB_PATH) as conn:
             conn.execute("""
@@ -585,7 +567,6 @@ def delete_favorite(fav_id):
             col.delete_one({"id": fav_id})
         except Exception:
             pass
-
     try:
         with sqlite3.connect(LOCAL_DB_PATH) as conn:
             conn.execute("DELETE FROM favorites WHERE id=?", (fav_id,))
@@ -593,7 +574,6 @@ def delete_favorite(fav_id):
     except Exception:
         pass
 
-# ----------------- Downloader Engine -----------------
 download_tasks = {}
 active_processes = {}
 download_queue = Queue()
@@ -611,9 +591,7 @@ def format_eta(seconds):
         return "--"
     m, s = divmod(int(seconds), 60)
     h, m = divmod(m, 60)
-    if h > 0:
-        return f"{h}h {m}m"
-    return f"{m}m {s}s"
+    return f"{h}h {m}m" if h > 0 else f"{m}m {s}s"
 
 def queue_worker():
     while True:
@@ -624,21 +602,17 @@ def queue_worker():
         if download_tasks.get(task_id, {}).get("status") == "Cancelled":
             download_queue.task_done()
             continue
-
         if download_type == "hf":
             hf_worker(task_id, target_url, dest_dir, custom_filename, token, is_startup)
         elif download_type == "civitai":
             civitai_curl_worker(task_id, target_url, dest_dir, custom_filename, token, meta, is_startup)
         else:
             aria2_worker(task_id, target_url, dest_dir, custom_filename, token, is_startup)
-
         download_queue.task_done()
 
 for _ in range(MAX_CONCURRENT_DOWNLOADS):
-    t = threading.Thread(target=queue_worker, daemon=True)
-    t.start()
+    threading.Thread(target=queue_worker, daemon=True).start()
 
-# --- HuggingFace Downloader with In-Process Python + hf_transfer ---
 def hf_worker(task_id, target_url, dest_dir, custom_filename, token, is_startup=False):
     parsed = parse_hf_url(target_url)
     if not parsed:
@@ -685,7 +659,6 @@ def hf_worker(task_id, target_url, dest_dir, custom_filename, token, is_startup=
             token=token.strip() if token else None
         )
         shutil.copy2(downloaded_cache_path, target_file)
-
         final_sz = os.path.getsize(target_file)
         download_tasks[task_id].update({
             "status": "Completed",
@@ -699,29 +672,19 @@ def hf_worker(task_id, target_url, dest_dir, custom_filename, token, is_startup=
         desc = f"**{final_name}** ({human_size(final_sz)}) downloaded via HF-Transfer to `{os.path.basename(dest_dir)}`"
         send_discord_notification(evt_title, desc, 0x238636)
     except Exception as e:
-        print(f"[WARN] In-process HF download error ({e}), switching to raw URL stream via Aria2...", flush=True)
+        print(f"[WARN] HF Direct Stream: {e}, falling back to Aria2 stream", flush=True)
         aria2_worker(task_id, parsed["raw_url"], dest_dir, final_name, token, is_startup)
 
 def civitai_curl_worker(task_id, target_url, dest_dir, custom_filename, token, meta=None, is_startup=False):
-    url = target_url.strip()
-    if "civitai.red" in url:
-        url = url.replace("civitai.red", "civitai.com")
-
+    url = target_url.strip().replace("civitai.red", "civitai.com")
     if token:
         url = re.sub(r'([?&])token=[^&]*', '', url)
         delim = "&" if "?" in url else "?"
         url = f"{url}{delim}token={token.strip()}"
 
-    final_name = custom_filename.strip()
-    total_bytes = (meta.get("total_bytes") if meta else 0) or 0
-
-    if not final_name and meta and meta.get("filename"):
-        final_name = meta["filename"]
-
-    if not final_name:
-        final_name = f"civitai_model_{task_id}.safetensors"
-
+    final_name = custom_filename.strip() or (meta.get("filename") if meta else "") or f"civitai_model_{task_id}.safetensors"
     dest_file = os.path.join(dest_dir, final_name)
+    total_bytes = (meta.get("total_bytes") if meta else 0) or 0
 
     if os.path.exists(dest_file) and os.path.getsize(dest_file) > 1024:
         download_tasks[task_id].update({
@@ -752,7 +715,6 @@ def civitai_curl_worker(task_id, target_url, dest_dir, custom_filename, token, m
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         active_processes[task_id] = proc
         download_tasks[task_id]["status"] = "Downloading"
-
         last_bytes = 0
         last_time = time.time()
 
@@ -761,11 +723,9 @@ def civitai_curl_worker(task_id, target_url, dest_dir, custom_filename, token, m
                 curr_size = os.path.getsize(dest_file)
                 now = time.time()
                 dt = now - last_time
-
                 if dt >= 1.0:
                     speed_bps = (curr_size - last_bytes) / dt
                     download_tasks[task_id]["speed"] = f"{human_size(speed_bps)}/s"
-
                     if total_bytes > 0:
                         pct = min(99, int((curr_size / total_bytes) * 100))
                         download_tasks[task_id]["progress"] = pct
@@ -774,11 +734,9 @@ def civitai_curl_worker(task_id, target_url, dest_dir, custom_filename, token, m
                         download_tasks[task_id]["eta"] = format_eta(eta_sec)
                     else:
                         download_tasks[task_id]["progress"] = 50
-
                     download_tasks[task_id]["downloaded_bytes"] = curr_size
                     last_bytes = curr_size
                     last_time = now
-
             threading.Event().wait(1.0)
 
         ret = proc.wait()
@@ -818,13 +776,10 @@ def aria2_worker(task_id, target_url, dest_dir, custom_filename, token, is_start
         "--summary-interval=1", "--console-log-level=notice", "--check-certificate=false",
         "-d", dest_dir
     ]
-
     if "huggingface.co" in url and token:
         cmd.extend(["--header", f"Authorization: Bearer {token.strip()}"])
-
     if custom_filename.strip():
         cmd.extend(["-o", custom_filename.strip()])
-
     cmd.append(url)
 
     download_tasks[task_id].update({
@@ -843,7 +798,6 @@ def aria2_worker(task_id, target_url, dest_dir, custom_filename, token, is_start
     try:
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
         active_processes[task_id] = process
-
         progress_pattern = re.compile(r'\((\d+)%\).*DL:([^\s\]]+)(?:.*ETA:([^\s\]]+))?')
         file_pattern = re.compile(r'Destination:\s+(.+)')
         last_lines = []
@@ -852,18 +806,15 @@ def aria2_worker(task_id, target_url, dest_dir, custom_filename, token, is_start
             line = line.strip()
             if not line:
                 continue
-
             last_lines.append(line)
             if len(last_lines) > 8:
                 last_lines.pop(0)
-
             file_match = file_pattern.search(line)
             if file_match:
                 fname = os.path.basename(file_match.group(1).strip())
                 download_tasks[task_id]["file"] = fname
                 if not download_tasks[task_id]["title"]:
                     download_tasks[task_id]["title"] = fname
-
             prog_match = progress_pattern.search(line)
             if prog_match:
                 download_tasks[task_id].update({
@@ -906,7 +857,6 @@ def aria2_worker(task_id, target_url, dest_dir, custom_filename, token, is_start
         if download_tasks[task_id]["status"] != "Cancelled":
             download_tasks[task_id].update({"status": "Error", "error_log": str(e)})
 
-# ----------------- Startup Auto-Installer Routine -----------------
 def trigger_startup_downloads():
     time.sleep(2)
     favs = get_all_favorites()
@@ -924,7 +874,6 @@ def trigger_startup_downloads():
         hf_token = get_setting("hf_token", "")
         civitai_token = get_setting("civitai_token", "")
         task_id = str(len(download_tasks) + 1)
-
         is_civitai = "civitai." in url_target
         is_hf = "huggingface.co" in url_target
 
@@ -957,12 +906,10 @@ def trigger_startup_downloads():
             "eta": "Queued",
             "error_log": ""
         }
-
         download_queue.put((task_id, url_target, dest_dir, filename, token, meta, download_type, True))
 
 threading.Thread(target=trigger_startup_downloads, daemon=True).start()
 
-# ----------------- Boot Notification Dispatcher -----------------
 def dispatch_instance_boot_alert():
     time.sleep(3)
     hostname = socket.gethostname()
@@ -989,7 +936,6 @@ def dispatch_instance_boot_alert():
 
 threading.Thread(target=dispatch_instance_boot_alert, daemon=True).start()
 
-# ----------------- HTTP Server Handler -----------------
 class ManagerHandler(BaseHTTPRequestHandler):
     def _send_json(self, data, status=200):
         body = json.dumps(data).encode("utf-8")
@@ -1036,7 +982,6 @@ class ManagerHandler(BaseHTTPRequestHandler):
         elif url.path == "/api/probe":
             query = urllib.parse.parse_qs(url.query)
             target = query.get("url", [""])[0].strip()
-
             if "civitai." in target:
                 meta = fetch_civitai_meta(target)
                 self._send_json(meta or {"error": "Not found"})
@@ -1067,11 +1012,9 @@ class ManagerHandler(BaseHTTPRequestHandler):
         if url.path == "/api/settings":
             save_settings(payload)
             self._send_json({"ok": True})
-
         elif url.path == "/api/groups":
             gid = save_group(payload)
             self._send_json({"ok": True, "id": gid})
-
         elif url.path == "/api/groups/delete":
             gid = payload.get("id")
             if gid:
@@ -1079,11 +1022,9 @@ class ManagerHandler(BaseHTTPRequestHandler):
                 self._send_json({"ok": True})
             else:
                 self.send_error(400, "Missing Group ID")
-
         elif url.path == "/api/favorites":
             fav_id = save_favorite(payload)
             self._send_json({"ok": True, "id": fav_id})
-
         elif url.path == "/api/favorites/toggle_auto":
             fav_id = payload.get("id")
             favs = get_all_favorites()
@@ -1094,7 +1035,6 @@ class ManagerHandler(BaseHTTPRequestHandler):
                 self._send_json({"ok": True, "auto_install": found["auto_install"]})
             else:
                 self.send_error(404, "Favorite not found")
-
         elif url.path == "/api/favorites/refresh_all":
             def run_async_refresh():
                 favs = get_all_favorites()
@@ -1115,10 +1055,8 @@ class ManagerHandler(BaseHTTPRequestHandler):
                         if parsed and not f.get("filename"):
                             f["filename"] = parsed["display_filename"]
                             save_favorite(f)
-
             threading.Thread(target=run_async_refresh, daemon=True).start()
             self._send_json({"ok": True, "message": "Async refresh scheduled"})
-
         elif url.path == "/api/favorites/delete":
             fav_id = payload.get("id")
             if fav_id:
@@ -1126,38 +1064,29 @@ class ManagerHandler(BaseHTTPRequestHandler):
                 self._send_json({"ok": True})
             else:
                 self.send_error(400, "Missing Favorite ID")
-
         elif url.path == "/api/models/move":
             old_cat = payload.get("old_category")
             new_cat = payload.get("new_category")
             filename = payload.get("filename")
-
-            src_folder = TARGET_DIRS.get(old_cat)
-            dst_folder = TARGET_DIRS.get(new_cat)
-            src_file = os.path.join(src_folder, filename)
-            dst_file = os.path.join(dst_folder, filename)
-
+            src_file = os.path.join(TARGET_DIRS.get(old_cat, ""), filename)
+            dst_file = os.path.join(TARGET_DIRS.get(new_cat, ""), filename)
             if os.path.exists(src_file) and not os.path.exists(dst_file):
                 shutil.move(src_file, dst_file)
                 self._send_json({"ok": True})
             else:
                 self.send_error(400, "Invalid file operation")
-
         elif url.path == "/api/models/rename":
             cat = payload.get("category")
             old_name = payload.get("old_name")
             new_name = payload.get("new_name", "").strip()
-
-            folder = TARGET_DIRS.get(cat)
+            folder = TARGET_DIRS.get(cat, "")
             old_path = os.path.join(folder, old_name)
             new_path = os.path.join(folder, new_name)
-
             if os.path.exists(old_path) and not os.path.exists(new_path):
                 shutil.move(old_path, new_path)
                 self._send_json({"ok": True})
             else:
                 self.send_error(400, "Invalid file operation")
-
         elif url.path == "/api/purge_temp":
             cleaned = 0
             for folder in TARGET_DIRS.values():
@@ -1174,28 +1103,23 @@ class ManagerHandler(BaseHTTPRequestHandler):
                             except Exception:
                                 pass
             self._send_json({"ok": True, "cleaned": cleaned})
-
         elif url.path == "/api/parse_workflow":
             wf_data = payload.get("workflow", {})
             text_str = json.dumps(wf_data)
             matches = re.findall(r'[\w\-\s\.]+\.(?:safetensors|ckpt|pt|bin)', text_str, re.IGNORECASE)
-            unique_matches = list(set(matches))
-
             installed_map = {}
             for cat, folder in TARGET_DIRS.items():
                 if os.path.exists(folder):
                     for f in os.listdir(folder):
                         installed_map[f.lower()] = cat
-
             models_found = []
-            for m in unique_matches:
+            for m in list(set(matches)):
                 models_found.append({
                     "name": m,
                     "installed": m.lower() in installed_map,
                     "category": installed_map.get(m.lower(), "unknown")
                 })
             self._send_json({"models": models_found})
-
         elif url.path == "/api/refresh_comfy":
             results = {"object_info": "skipped", "free": "skipped"}
             try:
@@ -1204,7 +1128,6 @@ class ManagerHandler(BaseHTTPRequestHandler):
                     results["object_info"] = "ok" if resp.status == 200 else str(resp.status)
             except Exception as e:
                 results["object_info"] = f"error: {str(e)}"
-
             try:
                 free_payload = json.dumps({"unload_models": True, "free_memory": True}).encode("utf-8")
                 req_free = urllib.request.Request(
@@ -1216,9 +1139,7 @@ class ManagerHandler(BaseHTTPRequestHandler):
                     results["free"] = "ok" if resp.status == 200 else str(resp.status)
             except Exception as e:
                 results["free"] = f"error: {str(e)}"
-
             self._send_json({"ok": True, "details": results})
-
         elif url.path == "/api/download":
             url_target = payload.get("url", "").strip()
             category = payload.get("category", "loras")
@@ -1232,10 +1153,8 @@ class ManagerHandler(BaseHTTPRequestHandler):
             hf_token = get_setting("hf_token", "")
             civitai_token = get_setting("civitai_token", "")
             task_id = str(len(download_tasks) + 1)
-
             is_civitai = "civitai." in url_target
             is_hf = "huggingface.co" in url_target
-
             meta = payload.get("meta")
             if not meta and is_civitai:
                 meta = fetch_civitai_meta(url_target)
@@ -1265,10 +1184,8 @@ class ManagerHandler(BaseHTTPRequestHandler):
                 "eta": "Queued",
                 "error_log": ""
             }
-
             download_queue.put((task_id, url_target, dest_dir, custom_name, token, meta, download_type, False))
             self._send_json({"task_id": task_id})
-
         elif url.path == "/api/cancel":
             task_id = str(payload.get("task_id", ""))
             if task_id in download_tasks:
@@ -1285,7 +1202,6 @@ class ManagerHandler(BaseHTTPRequestHandler):
                 self._send_json({"ok": True})
             else:
                 self.send_error(404, "Task not found")
-
         elif url.path == "/api/delete":
             category = payload.get("category")
             filename = payload.get("filename")
@@ -2058,7 +1974,6 @@ class ManagerHandler(BaseHTTPRequestHandler):
 
             let groupMap = {};
             cachedGroups.forEach(g => { groupMap[g.id] = g; });
-
             let groupedBuckets = {};
             let ungrouped = [];
 
@@ -2091,7 +2006,6 @@ class ManagerHandler(BaseHTTPRequestHandler):
 
                     let sz = item.total_bytes ? (item.total_bytes / (1024*1024)).toFixed(1) + ' MB' : '--';
                     let fn = item.filename ? `<div style="font-size:11px; color:var(--subtext); font-family:monospace;">${item.filename}</div>` : '';
-
                     let isAuto = !!item.auto_install;
                     let switchClass = isAuto ? 'on' : 'off';
                     let switchText = isAuto ? '⚡ Startup' : '💤 Manual';
@@ -2155,7 +2069,6 @@ class ManagerHandler(BaseHTTPRequestHandler):
                     </table>
                 </div>`;
             }
-
             container.innerHTML = html;
         }
 
@@ -2383,18 +2296,10 @@ class ManagerHandler(BaseHTTPRequestHandler):
         async function refreshModels() {
             let res = await fetch('/api/models');
             let data = await res.json();
-            
             let priHtml = '';
             let secHtml = '';
-
-            PRIORITY_CATS.forEach(cat => {
-                priHtml += renderCategoryBlock(cat, data[cat] || []);
-            });
-
-            ALL_CATS.filter(c => !PRIORITY_CATS.includes(c)).forEach(cat => {
-                secHtml += renderCategoryBlock(cat, data[cat] || []);
-            });
-
+            PRIORITY_CATS.forEach(cat => { priHtml += renderCategoryBlock(cat, data[cat] || []); });
+            ALL_CATS.filter(c => !PRIORITY_CATS.includes(c)).forEach(cat => { secHtml += renderCategoryBlock(cat, data[cat] || []); });
             document.getElementById('model_tables_priority').innerHTML = priHtml;
             document.getElementById('model_tables_secondary').innerHTML = secHtml;
         }
@@ -2481,16 +2386,24 @@ class ManagerHandler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     server = ThreadingHTTPServer(("0.0.0.0", 17890), ManagerHandler)
     server.serve_forever()
-EOF
+PY_EOF
 
-# 6. Stop previous listeners on 17890
-fuser -k 17890/tcp 2>/dev/null || true
+# 7. Release previous port binding & background cleanly
+fuser -k 17890/tcp >/dev/null 2>&1 || true
 
-# 7. Background the dashboard cleanly and return to terminal
 nohup "${PYTHON_BIN}" /opt/x-dashboard.py </dev/null > /var/log/comfy-xtra.log 2>&1 &
 disown -h $!
 
-echo "============================================================"
-echo " SUCCESS: Comfy-Xtra Online and Listening on Port 17890!    "
-echo "============================================================"
+send_discord "🚀 Comfy-Xtra Online" "Dashboard listening on port \`17890\`." 238636
+echo "Comfy-Xtra started on background pid $!"
+PROV_EOF
+
+# Strip Windows line endings (\r) from staged payload
+sed -i 's/\r$//' /tmp/run_comfy_xtra_provision.sh 2>/dev/null || true
+chmod +x /tmp/run_comfy_xtra_provision.sh
+
+# Launch the runner detached
+nohup /tmp/run_comfy_xtra_provision.sh </dev/null >/dev/null 2>&1 &
+
+# Exit with code 0 immediately to mark cloud template provisioning complete
 exit 0
