@@ -10,14 +10,14 @@ export HF_HUB_ENABLE_HF_TRANSFER=1
 
 LOG_FILE="/var/log/provisioning_comfy_xtra.log"
 mkdir -p "$(dirname "${LOG_FILE}")"
-# POSIX-compliant redirection (avoids process-substitution crashes under /bin/sh)
+# POSIX-compliant redirection avoiding /bin/sh syntax errors
 exec >> "${LOG_FILE}" 2>&1
 
 echo "============================================================"
 echo " [1/6] Launching Automated Comfy-Xtra Provisioning Script    "
 echo "============================================================"
 
-# --- 1. Robust Retry Function & Apt Lock Waiter ---
+# --- 1. Retry Function & Apt Lock Waiter ---
 run_with_retry() {
     local cmd="$1"
     local max_attempts="${2:-5}"
@@ -45,7 +45,7 @@ run_with_retry() {
     return 1
 }
 
-# Wait for background cloud-init / package locks to clear
+# Wait for background cloud package locks to release
 echo "Checking for existing package manager locks..."
 while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do
     echo "Waiting for background system apt tasks to finish..."
@@ -59,7 +59,7 @@ APT_OPTS="-y --no-install-recommends -o Dpkg::Options::=--force-confdef -o Dpkg:
 run_with_retry "apt-get update" 3 3
 run_with_retry "apt-get install ${APT_OPTS} aria2 ca-certificates psmisc curl jq supervisor" 5 5
 
-# --- 3. Resolve Python & Install Required Wheels (including hf_transfer) ---
+# --- 3. Resolve Python & Install Required Wheels ---
 echo "=== [3/6] Resolving Python & Installing pymongo + hf_transfer ==="
 if [ -f "/venv/main/bin/python" ]; then
     PYTHON_BIN="/venv/main/bin/python"
@@ -78,7 +78,6 @@ fi
 echo "Using Python: ${PYTHON_BIN}"
 echo "Using Pip:    ${PIP_BIN}"
 
-# Install certifi, pymongo, and huggingface_hub with Rust-based hf_transfer accelerator
 run_with_retry "${PIP_BIN} install --no-cache-dir certifi 'pymongo[srv]' 'huggingface_hub[hf_transfer]'" 5 4
 
 # --- 4. Ensure All ComfyUI Directory Scaffolding Exists ---
@@ -120,7 +119,7 @@ for folder in "${ALL_DIRS[@]}"; do
 done
 mkdir -p /var/log/supervisor /etc/supervisor/conf.d
 
-# Capture existing environment Mongo URI safely without unbound variable crashes
+# Capture existing Mongo URI safely
 RESOLVED_MONGO_URI="${MONGO_URI:-${MONGODB_URI:-${MONGO_URL:-}}}"
 if [ -n "${RESOLVED_MONGO_URI}" ]; then
     sed -i '/^MONGO_URI=/d' /etc/environment 2>/dev/null || true
@@ -401,7 +400,7 @@ def delete_group(gid):
     except Exception as e:
         print(f"[ERROR] SQLite delete_group failed: {e}", flush=True)
 
-# Metadata Helpers
+# URL & Metadata Helpers
 def fetch_civitai_meta(url_or_id):
     token = get_setting("civitai_token", "")
     target = url_or_id.strip()
@@ -471,13 +470,22 @@ def parse_hf_url(target_url):
         owner, repo, revision, filepath = match.groups()
         filepath = urllib.parse.unquote(filepath)
         filename = os.path.basename(filepath)
+        raw_download_url = f"https://huggingface.co/{owner}/{repo}/resolve/{revision}/{urllib.parse.quote(filepath)}"
         return {
             "repo_id": f"{owner}/{repo}",
             "filename": filepath,
             "display_filename": filename,
-            "revision": revision
+            "revision": revision,
+            "raw_url": raw_download_url
         }
     return None
+
+def find_hf_cli():
+    py_dir = os.path.dirname(sys.executable)
+    candidate = os.path.join(py_dir, "huggingface-cli")
+    if os.path.exists(candidate) and os.access(candidate, os.X_OK):
+        return candidate
+    return shutil.which("huggingface-cli")
 
 # Favorites Helpers
 def get_all_favorites():
@@ -673,7 +681,7 @@ for _ in range(MAX_CONCURRENT_DOWNLOADS):
     t = threading.Thread(target=queue_worker, daemon=True)
     t.start()
 
-# --- HuggingFace Accelerated Downloader (hf-cli + hf_transfer) ---
+# --- HuggingFace Accelerated Downloader (hf-cli + Fallback) ---
 def hf_cli_worker(task_id, target_url, dest_dir, custom_filename, token, is_startup=False):
     parsed = parse_hf_url(target_url)
     if not parsed:
@@ -697,96 +705,100 @@ def hf_cli_worker(task_id, target_url, dest_dir, custom_filename, token, is_star
         })
         return
 
-    download_tasks[task_id].update({
-        "status": "Accelerating (HF-CLI)",
-        "file": final_name,
-        "title": f"{repo_id} - {final_name}",
-        "image_url": "",
-        "progress": 5,
-        "downloaded_bytes": 0,
-        "total_bytes": 0,
-        "speed": "HF-Transfer",
-        "eta": "Connecting...",
-        "error_log": ""
-    })
+    hf_cli_bin = find_hf_cli()
+    
+    if hf_cli_bin:
+        tmp_dl_dir = os.path.join(dest_dir, f".tmp_hf_{task_id}")
+        os.makedirs(tmp_dl_dir, exist_ok=True)
 
-    # Prepare isolated local directory to download using huggingface-cli
-    tmp_dl_dir = os.path.join(dest_dir, f".tmp_hf_{task_id}")
-    os.makedirs(tmp_dl_dir, exist_ok=True)
+        cmd = [
+            hf_cli_bin, "download",
+            repo_id,
+            file_path,
+            "--revision", revision,
+            "--local-dir", tmp_dl_dir
+        ]
 
-    cmd = [
-        sys.executable, "-m", "huggingface_hub.cli.core", "download",
-        repo_id,
-        file_path,
-        "--revision", revision,
-        "--local-dir", tmp_dl_dir
-    ]
+        env = os.environ.copy()
+        env["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+        if token:
+            env["HF_TOKEN"] = token.strip()
 
-    env = os.environ.copy()
-    env["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
-    if token:
-        env["HF_TOKEN"] = token.strip()
+        download_tasks[task_id].update({
+            "status": "Downloading (HF-Transfer)",
+            "file": final_name,
+            "title": f"{repo_id} - {final_name}",
+            "image_url": "",
+            "progress": 10,
+            "downloaded_bytes": 0,
+            "total_bytes": 0,
+            "speed": "Fast Turbo",
+            "eta": "Downloading...",
+            "error_log": ""
+        })
 
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            env=env
-        )
-        active_processes[task_id] = proc
-        download_tasks[task_id]["status"] = "Downloading (HF-Transfer)"
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=env
+            )
+            active_processes[task_id] = proc
+            expected_dl_file = os.path.join(tmp_dl_dir, file_path)
 
-        expected_dl_file = os.path.join(tmp_dl_dir, file_path)
-        last_bytes = 0
-        last_time = time.time()
+            last_bytes = 0
+            last_time = time.time()
 
-        while proc.poll() is None:
-            if os.path.exists(expected_dl_file):
-                curr_sz = os.path.getsize(expected_dl_file)
-                now = time.time()
-                dt = now - last_time
-                if dt >= 1.0:
-                    speed_bps = (curr_sz - last_bytes) / dt
-                    download_tasks[task_id]["speed"] = f"{human_size(speed_bps)}/s"
-                    download_tasks[task_id]["downloaded_bytes"] = curr_sz
-                    last_bytes = curr_sz
-                    last_time = now
-            threading.Event().wait(1.0)
+            while proc.poll() is None:
+                if os.path.exists(expected_dl_file):
+                    curr_sz = os.path.getsize(expected_dl_file)
+                    now = time.time()
+                    dt = now - last_time
+                    if dt >= 1.0:
+                        speed_bps = (curr_sz - last_bytes) / dt
+                        download_tasks[task_id]["speed"] = f"{human_size(speed_bps)}/s"
+                        download_tasks[task_id]["downloaded_bytes"] = curr_sz
+                        download_tasks[task_id]["progress"] = 50
+                        last_bytes = curr_sz
+                        last_time = now
+                threading.Event().wait(1.0)
 
-        ret = proc.wait()
-        active_processes.pop(task_id, None)
+            ret = proc.wait()
+            active_processes.pop(task_id, None)
 
-        if download_tasks[task_id]["status"] == "Cancelled":
+            if download_tasks[task_id]["status"] == "Cancelled":
+                shutil.rmtree(tmp_dl_dir, ignore_errors=True)
+                return
+
+            if ret == 0 and os.path.exists(expected_dl_file):
+                shutil.move(expected_dl_file, target_file)
+                shutil.rmtree(tmp_dl_dir, ignore_errors=True)
+                final_sz = os.path.getsize(target_file)
+                download_tasks[task_id].update({
+                    "status": "Completed",
+                    "progress": 100,
+                    "downloaded_bytes": final_sz,
+                    "total_bytes": final_sz,
+                    "speed": "--",
+                    "eta": "Done"
+                })
+                evt_title = "⚡ Autoload Model Installed" if is_startup else "🎉 Model Download Complete"
+                desc = f"**{final_name}** ({human_size(final_sz)}) downloaded via HF-Transfer to `{os.path.basename(dest_dir)}`"
+                send_discord_notification(evt_title, desc, 0x238636)
+                return
+            else:
+                shutil.rmtree(tmp_dl_dir, ignore_errors=True)
+        except Exception as e:
+            active_processes.pop(task_id, None)
             shutil.rmtree(tmp_dl_dir, ignore_errors=True)
-            return
+            if download_tasks[task_id]["status"] == "Cancelled":
+                return
 
-        if ret == 0 and os.path.exists(expected_dl_file):
-            shutil.move(expected_dl_file, target_file)
-            shutil.rmtree(tmp_dl_dir, ignore_errors=True)
-
-            final_sz = os.path.getsize(target_file)
-            download_tasks[task_id].update({
-                "status": "Completed",
-                "progress": 100,
-                "downloaded_bytes": final_sz,
-                "total_bytes": final_sz,
-                "speed": "--",
-                "eta": "Done"
-            })
-            evt_title = "⚡ Autoload Model Installed" if is_startup else "🎉 Model Download Complete"
-            desc = f"**{final_name}** ({human_size(final_sz)}) downloaded via HF-Transfer to `{os.path.basename(dest_dir)}`"
-            send_discord_notification(evt_title, desc, 0x238636)
-        else:
-            err_msg = f"HF-CLI download failed (code {ret})"
-            download_tasks[task_id].update({"status": "Failed", "error_log": err_msg})
-            shutil.rmtree(tmp_dl_dir, ignore_errors=True)
-    except Exception as e:
-        active_processes.pop(task_id, None)
-        shutil.rmtree(tmp_dl_dir, ignore_errors=True)
-        if download_tasks[task_id]["status"] != "Cancelled":
-            download_tasks[task_id].update({"status": "Error", "error_log": str(e)})
+    # Fallback to direct Raw URL via Aria2
+    print(f"[INFO] Running direct raw URL download fallback for {final_name}", flush=True)
+    aria2_worker(task_id, parsed["raw_url"], dest_dir, final_name, token, is_startup)
 
 def civitai_curl_worker(task_id, target_url, dest_dir, custom_filename, token, meta=None, is_startup=False):
     url = target_url.strip()
@@ -927,6 +939,9 @@ def aria2_worker(task_id, target_url, dest_dir, custom_filename, token, is_start
         "-d", dest_dir
     ]
 
+    if "huggingface.co" in url and token:
+        cmd.extend(["--header", f"Authorization: Bearer {token.strip()}"])
+
     if custom_filename.strip():
         cmd.extend(["-o", custom_filename.strip()])
 
@@ -992,15 +1007,22 @@ def aria2_worker(task_id, target_url, dest_dir, custom_filename, token, is_start
             return
 
         if return_code == 0:
+            final_sz = 0
+            resolved_fname = download_tasks[task_id].get("file", "model")
+            resolved_file_path = os.path.join(dest_dir, resolved_fname)
+            if os.path.exists(resolved_file_path):
+                final_sz = os.path.getsize(resolved_file_path)
+
             download_tasks[task_id].update({
                 "status": "Completed",
                 "progress": 100,
+                "downloaded_bytes": final_sz,
+                "total_bytes": final_sz,
                 "speed": "--",
                 "eta": "Done"
             })
-            fname = download_tasks[task_id].get("file", "model")
             evt_title = "⚡ Autoload Model Installed" if is_startup else "🎉 Model Download Complete"
-            desc = f"**{fname}** downloaded via Aria2 to `{os.path.basename(dest_dir)}`"
+            desc = f"**{resolved_fname}** downloaded via Aria2 to `{os.path.basename(dest_dir)}`"
             send_discord_notification(evt_title, desc, 0x238636)
         else:
             err_msg = " | ".join(last_lines[-2:]) if last_lines else f"Failed (exit code {return_code})"
@@ -2622,12 +2644,12 @@ stderr_logfile=/var/log/supervisor/comfy-xtra.err.log
 stdout_logfile=/var/log/supervisor/comfy-xtra.out.log
 EOF
 
-# Release port 17890 if already bound
+# Free port 17890 if already bound
 if command -v fuser >/dev/null 2>&1; then
     fuser -k 17890/tcp || true
 fi
 
-# Ensure supervisor daemon is running
+# Ensure supervisor daemon is up
 if ! pgrep -x "supervisord" >/dev/null 2>&1; then
     if [ -f "/etc/supervisor/supervisord.conf" ]; then
         supervisord -c /etc/supervisor/supervisord.conf
