@@ -1,108 +1,108 @@
 #!/bin/sh
-# Safe POSIX entrypoint compatible with cloud template runners (/bin/sh and /bin/bash)
-set -e
+# Comfy-Xtra production provisioner. Keep this file LF-only.
+set -eu
 
-export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+STAGED="/tmp/run_comfy_xtra_provision.sh"
 
-# Stage background provisioner payload to /tmp
-cat <<'PROV_EOF' > /tmp/run_comfy_xtra_provision.sh
+cat <<'PROV_EOF' > "$STAGED"
 #!/bin/bash
-# Do NOT exit on non-critical network / package warnings
-set +e
+set -Eeuo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
 export UCF_FORCE_CONFFOLD=1
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
-export HF_HUB_ENABLE_HF_TRANSFER=1
+export HF_XET_HIGH_PERFORMANCE=1
 
 LOG_FILE="/var/log/provisioning_comfy_xtra.log"
-mkdir -p "$(dirname "${LOG_FILE}")"
-exec >> "${LOG_FILE}" 2>&1
+DASH_LOG="/var/log/comfy-xtra.log"
+ENV_FILE="/workspace/.comfy_xtra.env"
+PASS_FILE="/workspace/.comfy_xtra_password"
+mkdir -p /workspace /var/log
+exec >>"$LOG_FILE" 2>&1
 
-echo "============================================================"
-echo " Starting Comfy-Xtra Provisioning Pipeline                  "
-echo "============================================================"
-
-# Resolve Database & Discord Webhooks safely without triggering exit 1
-RESOLVED_MONGO_URI="${MONGO_URI:-${MONGODB_URI:-${MONGO_URL:-}}}"
-DISCORD_URL="${DISCORD_WEBHOOK:-${DISCORD_WEBHOOK_URL:-}}"
-
-if [ -z "${DISCORD_URL}" ] && [ -f "/etc/environment" ]; then
-    DISCORD_URL=$(grep -E '^(DISCORD_WEBHOOK|DISCORD_WEBHOOK_URL)=' /etc/environment 2>/dev/null | head -n 1 | cut -d'=' -f2- | tr -d '"'\''' || true)
-fi
-
-send_discord() {
-    local title="$1"
-    local desc="$2"
-    local color="${3:-3447003}"
-    if [ -n "${DISCORD_URL}" ]; then
-        curl -s -X POST "${DISCORD_URL}" \
-            -H "Content-Type: application/json" \
-            -d "{\"embeds\":[{\"title\":\"${title}\",\"description\":\"${desc}\",\"color\":${color},\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}]}" >/dev/null 2>&1 || true
-    fi
+log(){ printf '%s %s\n' "$(date -Is)" "$*"; }
+retry(){
+  local attempts="$1"; shift
+  local delay=2 n=1
+  until "$@"; do
+    local rc=$?
+    if (( n >= attempts )); then log "ERROR: command failed after ${n} attempts (rc=${rc}): $*"; return "$rc"; fi
+    log "WARN: command failed (attempt ${n}/${attempts}, rc=${rc}); retrying in ${delay}s: $*"
+    sleep "$delay"; delay=$(( delay < 60 ? delay * 2 : 60 )); n=$((n+1))
+  done
 }
 
-send_discord "⚙️ Provisioning Started" "Comfy-Xtra setup started on \`$(hostname)\`." 3447003
+RESOLVED_MONGO_URI="${MONGO_URI:-${MONGODB_URI:-${MONGO_URL:-}}}"
+DISCORD_URL="${DISCORD_WEBHOOK:-${DISCORD_WEBHOOK_URL:-}}"
+COMFY_XTRA_USER="${COMFY_XTRA_USER:-admin}"
+COMFY_XTRA_PASSWORD="${COMFY_XTRA_PASSWORD:-}"
 
-# 1. Resolve Python Binary
-if [ -f "/venv/main/bin/python" ]; then
-    PYTHON_BIN="/venv/main/bin/python"
-    PIP_BIN="/venv/main/bin/pip"
-elif [ -f "/opt/conda/bin/python" ]; then
-    PYTHON_BIN="/opt/conda/bin/python"
-    PIP_BIN="/opt/conda/bin/pip"
-elif command -v python3 >/dev/null 2>&1; then
-    PYTHON_BIN="$(command -v python3)"
-    PIP_BIN="$(command -v pip3 || command -v pip)"
-else
-    send_discord "❌ Provisioning Failed" "No suitable Python environment discovered." 15158332
-    exit 1
+if [[ -z "$COMFY_XTRA_PASSWORD" ]]; then
+  if [[ -s "$PASS_FILE" ]]; then
+    COMFY_XTRA_PASSWORD="$(cat "$PASS_FILE")"
+  else
+    COMFY_XTRA_PASSWORD="$(python3 - <<'PYPASS'
+import secrets
+print(secrets.token_urlsafe(18))
+PYPASS
+)"
+    printf '%s\n' "$COMFY_XTRA_PASSWORD" > "$PASS_FILE"
+    chmod 600 "$PASS_FILE"
+  fi
 fi
 
-echo "Using Python: ${PYTHON_BIN}"
-echo "Using Pip:    ${PIP_BIN}"
+send_discord(){
+  local title="$1" desc="$2" color="${3:-3447003}"
+  [[ -z "$DISCORD_URL" ]] && return 0
+  curl -fsS --connect-timeout 5 --max-time 10 -X POST "$DISCORD_URL" \
+    -H 'Content-Type: application/json' \
+    --data "$(python3 - "$title" "$desc" "$color" <<'PYJSON'
+import json,sys,datetime
+print(json.dumps({"embeds":[{"title":sys.argv[1],"description":sys.argv[2],"color":int(sys.argv[3]),"timestamp":datetime.datetime.now(datetime.timezone.utc).isoformat()}]}))
+PYJSON
+)" >/dev/null 2>&1 || true
+}
 
-# 2. Wait for system cloud apt locks to release
-for i in {1..30}; do
-    if ! fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 && ! fuser /var/lib/apt/lists/lock >/dev/null 2>&1; then
-        break
-    fi
+log "Starting Comfy-Xtra provisioning"
+send_discord "⚙️ Provisioning Started" "Comfy-Xtra setup started on `$(hostname)`." 3447003
+
+if [[ -x /venv/main/bin/python ]]; then PYTHON_BIN=/venv/main/bin/python
+elif [[ -x /opt/conda/bin/python ]]; then PYTHON_BIN=/opt/conda/bin/python
+elif command -v python3 >/dev/null 2>&1; then PYTHON_BIN="$(command -v python3)"
+else log "ERROR: no Python found"; send_discord "❌ Provisioning Failed" "No Python environment found." 15158332; exit 1
+fi
+
+log "Python: $PYTHON_BIN"
+
+# Wait for apt/dpkg locks rather than racing cloud-init.
+if command -v fuser >/dev/null 2>&1; then
+  for _ in $(seq 1 120); do
+    if ! fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock >/dev/null 2>&1; then break; fi
     sleep 2
-done
-
-# 3. Base Utilities
-apt-get update -y || true
-apt-get install -y --no-install-recommends aria2 ca-certificates curl jq psmisc || true
-
-# 4. Pip Wheels (including hf_transfer turbo engine)
-"${PIP_BIN}" install --no-cache-dir certifi 'pymongo[srv]' 'huggingface_hub[hf_transfer]' || true
-
-# 5. Scaffold all 27 ComfyUI Model Directories
-COMFY_BASE="/workspace/ComfyUI/models"
-ALL_DIRS=(
-    "audio_encoders" "background_removal" "checkpoints" "ckpt" "clip" "clip_vision"
-    "configs" "controlnet" "detection" "diffusers" "diffusion_models" "embeddings"
-    "frame_interpolation" "geometry_estimation" "gligen" "hypernetworks" "latent_upscale_models"
-    "loras" "model_patches" "optical_flow" "photomaker" "style_models" "text_encoders"
-    "unet" "upscale_models" "vae" "vae_approx"
-)
-
-for folder in "${ALL_DIRS[@]}"; do
-    mkdir -p "${COMFY_BASE}/${folder}"
-done
-
-# Persist environment variables
-if [ -n "${RESOLVED_MONGO_URI}" ]; then
-    sed -i '/^MONGO_URI=/d' /etc/environment 2>/dev/null || true
-    echo "MONGO_URI=\"${RESOLVED_MONGO_URI}\"" >> /etc/environment
-fi
-if [ -n "${DISCORD_URL}" ]; then
-    sed -i '/^DISCORD_WEBHOOK=/d' /etc/environment 2>/dev/null || true
-    echo "DISCORD_WEBHOOK=\"${DISCORD_URL}\"" >> /etc/environment
+  done
 fi
 
-# 6. Deploy /opt/x-dashboard.py
+retry 5 apt-get update -y
+retry 5 apt-get install -y --no-install-recommends aria2 ca-certificates curl jq psmisc openssl
+retry 5 "$PYTHON_BIN" -m pip install --no-cache-dir -U certifi 'pymongo[srv]' huggingface_hub hf_xet
+
+COMFY_BASE=/workspace/ComfyUI/models
+for folder in audio_encoders background_removal checkpoints ckpt clip clip_vision configs controlnet detection diffusers diffusion_models embeddings frame_interpolation geometry_estimation gligen hypernetworks latent_upscale_models loras model_patches optical_flow photomaker style_models text_encoders unet upscale_models vae vae_approx; do
+  mkdir -p "$COMFY_BASE/$folder"
+done
+
+# Persist only for the supervisor; chmod keeps tokens private from other users.
+{
+  printf 'export MONGO_URI=%q\n' "$RESOLVED_MONGO_URI"
+  printf 'export DISCORD_WEBHOOK=%q\n' "$DISCORD_URL"
+  printf 'export COMFY_XTRA_USER=%q\n' "$COMFY_XTRA_USER"
+  printf 'export COMFY_XTRA_PASSWORD=%q\n' "$COMFY_XTRA_PASSWORD"
+  printf 'export HF_XET_HIGH_PERFORMANCE=1\n'
+} > "$ENV_FILE"
+chmod 600 "$ENV_FILE"
+
 cat <<'PY_EOF' > /opt/x-dashboard.py
 import os
 import re
@@ -117,6 +117,9 @@ import threading
 import subprocess
 import urllib.request
 import urllib.parse
+import uuid
+import base64
+import logging
 from queue import Queue
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pymongo import MongoClient
@@ -150,6 +153,15 @@ GROUPS_COL = "groups"
 LOCAL_DB_PATH = "/workspace/model_manager.db"
 COMFY_BASE = "/workspace/ComfyUI/models"
 COMFY_INTERNAL_URL = "http://127.0.0.1:8188"
+AUTH_USER = os.environ.get("COMFY_XTRA_USER", "admin").strip() or "admin"
+AUTH_PASSWORD = os.environ.get("COMFY_XTRA_PASSWORD", "").strip()
+MAX_TASK_RETRIES = max(0, int(os.environ.get("COMFY_XTRA_MAX_TASK_RETRIES", "3")))
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(threadName)s %(message)s",
+)
+logger = logging.getLogger("comfy-xtra")
 
 ALL_CATEGORIES = [
     "checkpoints", "loras", "unet", "diffusion_models", "clip", "vae", "controlnet", "upscale_models", "embeddings",
@@ -166,23 +178,55 @@ TARGET_DIRS = {cat: os.path.join(COMFY_BASE, cat) for cat in ALL_CATEGORIES}
 for folder in TARGET_DIRS.values():
     os.makedirs(folder, exist_ok=True)
 
+def safe_filename(name):
+    name = (name or "").strip()
+    if not name or name in {".", ".."}:
+        raise ValueError("Invalid filename")
+    if name != os.path.basename(name) or "/" in name or "\\" in name or "\x00" in name:
+        raise ValueError("Unsafe filename")
+    return name
+
+def safe_model_path(category, filename):
+    if category not in TARGET_DIRS:
+        raise ValueError("Invalid category")
+    filename = safe_filename(filename)
+    base = os.path.realpath(TARGET_DIRS[category])
+    target = os.path.realpath(os.path.join(base, filename))
+    if os.path.commonpath([base, target]) != base:
+        raise ValueError("Unsafe path")
+    return target
+
 mongo_client = None
+mongo_lock = threading.Lock()
+mongo_failed_until = 0.0
 
 def get_mongo_db():
-    global mongo_client
+    global mongo_client, mongo_failed_until
     if not MONGO_URI:
         return None
-    if mongo_client is None:
+    if time.time() < mongo_failed_until:
+        return None
+    with mongo_lock:
+        if mongo_client is not None:
+            return mongo_client[DB_NAME]
         try:
-            mongo_client = MongoClient(
+            client = MongoClient(
                 MONGO_URI,
                 tlsCAFile=certifi.where(),
                 server_api=ServerApi('1'),
-                serverSelectionTimeoutMS=4000
+                serverSelectionTimeoutMS=4000,
+                connectTimeoutMS=4000,
+                socketTimeoutMS=8000,
             )
-        except Exception:
+            client.admin.command("ping")
+            mongo_client = client
+            logger.info("MongoDB connection verified")
+            return mongo_client[DB_NAME]
+        except Exception as exc:
+            logger.warning("MongoDB unavailable; using SQLite fallback: %s", exc)
+            mongo_client = None
+            mongo_failed_until = time.time() + 30
             return None
-    return mongo_client[DB_NAME]
 
 def init_local_db():
     conn = sqlite3.connect(LOCAL_DB_PATH)
@@ -209,6 +253,18 @@ def init_local_db():
                 emoji TEXT
             )
         """)
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(favorites)")}
+        migrations = {
+            "image_url": "TEXT",
+            "filename": "TEXT",
+            "total_bytes": "INTEGER DEFAULT 0",
+            "trained_words": "TEXT",
+            "auto_install": "INTEGER DEFAULT 0",
+        }
+        for column, sql_type in migrations.items():
+            if column not in existing:
+                conn.execute(f"ALTER TABLE favorites ADD COLUMN {column} {sql_type}")
+        conn.commit()
     return conn
 
 init_local_db()
@@ -424,7 +480,10 @@ def parse_hf_url(target_url):
         owner, repo, revision, filepath = match.groups()
         filepath = urllib.parse.unquote(filepath)
         filename = os.path.basename(filepath)
-        raw_download_url = f"https://huggingface.co/{owner}/{repo}/resolve/{revision}/{urllib.parse.quote(filepath)}"
+        if not filename.lower().endswith(".safetensors"):
+            return None
+        quoted_path = urllib.parse.quote(filepath, safe="/")
+        raw_download_url = f"https://huggingface.co/{owner}/{repo}/resolve/{revision}/{quoted_path}"
         return {
             "repo_id": f"{owner}/{repo}",
             "filename": filepath,
@@ -593,87 +652,113 @@ def format_eta(seconds):
     h, m = divmod(m, 60)
     return f"{h}h {m}m" if h > 0 else f"{m}m {s}s"
 
+def _requeue_task(task_info, task_id):
+    task = download_tasks.get(task_id)
+    if not task or task.get("status") == "Cancelled":
+        return
+    attempt = int(task.get("attempt", 1))
+    if attempt > MAX_TASK_RETRIES:
+        return
+    delay = min(60, 2 ** max(1, attempt))
+    task.update({
+        "status": "Retry scheduled",
+        "eta": f"Retry in {delay}s",
+        "speed": "--",
+    })
+    logger.warning("Task %s retry %s/%s in %ss: %s", task_id, attempt, MAX_TASK_RETRIES, delay, task.get("error_log", ""))
+    def put_back():
+        current = download_tasks.get(task_id)
+        if current and current.get("status") != "Cancelled":
+            current["status"] = "Queued"
+            current["eta"] = "Queued"
+            download_queue.put(task_info)
+    timer = threading.Timer(delay, put_back)
+    timer.daemon = True
+    timer.start()
+
 def queue_worker():
     while True:
         task_info = download_queue.get()
-        if task_info is None:
-            break
-        task_id, target_url, dest_dir, custom_filename, token, meta, download_type, is_startup = task_info
-        if download_tasks.get(task_id, {}).get("status") == "Cancelled":
+        try:
+            if task_info is None:
+                return
+            task_id, target_url, dest_dir, custom_filename, token, meta, download_type, is_startup = task_info
+            task = download_tasks.get(task_id)
+            if not task or task.get("status") == "Cancelled":
+                continue
+            task["attempt"] = int(task.get("attempt", 0)) + 1
+            try:
+                if download_type == "hf":
+                    hf_worker(task_id, target_url, dest_dir, custom_filename, token, is_startup)
+                elif download_type == "civitai":
+                    civitai_curl_worker(task_id, target_url, dest_dir, custom_filename, token, meta, is_startup)
+                else:
+                    aria2_worker(task_id, target_url, dest_dir, custom_filename, token, is_startup)
+            except Exception as exc:
+                logger.exception("Unhandled download worker failure for %s", task_id)
+                task.update({"status": "Error", "error_log": str(exc)})
+            if task.get("status") in {"Failed", "Error"} and task.get("attempt", 0) <= MAX_TASK_RETRIES:
+                _requeue_task(task_info, task_id)
+        finally:
             download_queue.task_done()
-            continue
-        if download_type == "hf":
-            hf_worker(task_id, target_url, dest_dir, custom_filename, token, is_startup)
-        elif download_type == "civitai":
-            civitai_curl_worker(task_id, target_url, dest_dir, custom_filename, token, meta, is_startup)
-        else:
-            aria2_worker(task_id, target_url, dest_dir, custom_filename, token, is_startup)
-        download_queue.task_done()
 
 for _ in range(MAX_CONCURRENT_DOWNLOADS):
-    threading.Thread(target=queue_worker, daemon=True).start()
+    threading.Thread(target=queue_worker, daemon=True, name=f"download-worker-{_+1}").start()
 
 def hf_worker(task_id, target_url, dest_dir, custom_filename, token, is_startup=False):
     parsed = parse_hf_url(target_url)
     if not parsed:
-        aria2_worker(task_id, target_url, dest_dir, custom_filename, token, is_startup)
+        download_tasks[task_id].update({
+            "status": "Failed",
+            "error_log": "Expected a direct Hugging Face .safetensors URL using /resolve/ or /blob/.",
+        })
         return
 
     repo_id = parsed["repo_id"]
     file_path = parsed["filename"]
     revision = parsed["revision"]
-    final_name = custom_filename.strip() or parsed["display_filename"]
-    target_file = os.path.join(dest_dir, final_name)
+    final_name = safe_filename(custom_filename.strip() or parsed["display_filename"])
+    target_file = safe_model_path(next(k for k,v in TARGET_DIRS.items() if v == dest_dir), final_name)
 
     if os.path.exists(target_file) and os.path.getsize(target_file) > 1024:
         download_tasks[task_id].update({
-            "status": "Completed",
-            "progress": 100,
+            "status": "Completed", "progress": 100,
             "downloaded_bytes": os.path.getsize(target_file),
-            "total_bytes": os.path.getsize(target_file),
-            "speed": "--",
-            "eta": "Already Exists"
+            "total_bytes": os.path.getsize(target_file), "speed": "--", "eta": "Already Exists"
         })
         return
 
     download_tasks[task_id].update({
-        "status": "Downloading (HF-Transfer)",
-        "file": final_name,
+        "status": "Downloading (Hugging Face)", "file": final_name,
         "title": f"{repo_id} - {final_name}",
         "image_url": "https://huggingface.co/front/assets/huggingface_logo-noborder.svg",
-        "progress": 25,
-        "downloaded_bytes": 0,
-        "total_bytes": 0,
-        "speed": "HF Turbo",
-        "eta": "Fast Stream...",
-        "error_log": ""
+        "progress": 10, "downloaded_bytes": 0, "total_bytes": 0,
+        "speed": "HF/Xet", "eta": "Downloading...", "error_log": ""
     })
 
     try:
         from huggingface_hub import hf_hub_download
-        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
-        downloaded_cache_path = hf_hub_download(
-            repo_id=repo_id,
-            filename=file_path,
-            revision=revision,
-            token=token.strip() if token else None
+        local_path = hf_hub_download(
+            repo_id=repo_id, filename=file_path, revision=revision,
+            token=token.strip() if token else None, local_dir=dest_dir,
         )
-        shutil.copy2(downloaded_cache_path, target_file)
+        if download_tasks[task_id].get("status") == "Cancelled":
+            return
+        if os.path.realpath(local_path) != os.path.realpath(target_file):
+            os.makedirs(os.path.dirname(target_file), exist_ok=True)
+            os.replace(local_path, target_file)
         final_sz = os.path.getsize(target_file)
+        if final_sz <= 1024:
+            raise RuntimeError("Downloaded file is unexpectedly small")
         download_tasks[task_id].update({
-            "status": "Completed",
-            "progress": 100,
-            "downloaded_bytes": final_sz,
-            "total_bytes": final_sz,
-            "speed": "--",
-            "eta": "Done"
+            "status": "Completed", "progress": 100, "downloaded_bytes": final_sz,
+            "total_bytes": final_sz, "speed": "--", "eta": "Done", "error_log": ""
         })
         evt_title = "⚡ Autoload Model Installed" if is_startup else "🎉 Model Download Complete"
-        desc = f"**{final_name}** ({human_size(final_sz)}) downloaded via HF-Transfer to `{os.path.basename(dest_dir)}`"
-        send_discord_notification(evt_title, desc, 0x238636)
-    except Exception as e:
-        print(f"[WARN] HF Direct Stream: {e}, falling back to Aria2 stream", flush=True)
-        aria2_worker(task_id, parsed["raw_url"], dest_dir, final_name, token, is_startup)
+        send_discord_notification(evt_title, f"**{final_name}** ({human_size(final_sz)}) downloaded from Hugging Face to `{os.path.basename(dest_dir)}`", 0x238636)
+    except Exception as exc:
+        logger.warning("Hugging Face download failed for %s: %s", repo_id, exc)
+        download_tasks[task_id].update({"status": "Failed", "error_log": f"Hugging Face: {exc}"})
 
 def civitai_curl_worker(task_id, target_url, dest_dir, custom_filename, token, meta=None, is_startup=False):
     url = target_url.strip().replace("civitai.red", "civitai.com")
@@ -683,7 +768,10 @@ def civitai_curl_worker(task_id, target_url, dest_dir, custom_filename, token, m
         url = f"{url}{delim}token={token.strip()}"
 
     final_name = custom_filename.strip() or (meta.get("filename") if meta else "") or f"civitai_model_{task_id}.safetensors"
-    dest_file = os.path.join(dest_dir, final_name)
+    final_name = safe_filename(final_name)
+    category = next(k for k, v in TARGET_DIRS.items() if v == dest_dir)
+    dest_file = safe_model_path(category, final_name)
+    temp_file = dest_file + ".part"
     total_bytes = (meta.get("total_bytes") if meta else 0) or 0
 
     if os.path.exists(dest_file) and os.path.getsize(dest_file) > 1024:
@@ -710,17 +798,21 @@ def civitai_curl_worker(task_id, target_url, dest_dir, custom_filename, token, m
         "error_log": ""
     })
 
-    cmd = ["curl", "-L", "-A", "Mozilla/5.0", "--fail", "-o", dest_file, url]
+    cmd = [
+        "curl", "-L", "-A", "Mozilla/5.0", "--fail", "--silent", "--show-error",
+        "--retry", "5", "--retry-delay", "3", "--retry-all-errors",
+        "--connect-timeout", "15", "--max-time", "0", "-o", temp_file, url
+    ]
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         active_processes[task_id] = proc
         download_tasks[task_id]["status"] = "Downloading"
         last_bytes = 0
         last_time = time.time()
 
         while proc.poll() is None:
-            if os.path.exists(dest_file):
-                curr_size = os.path.getsize(dest_file)
+            if os.path.exists(temp_file):
+                curr_size = os.path.getsize(temp_file)
                 now = time.time()
                 dt = now - last_time
                 if dt >= 1.0:
@@ -743,13 +835,16 @@ def civitai_curl_worker(task_id, target_url, dest_dir, custom_filename, token, m
         active_processes.pop(task_id, None)
 
         if download_tasks[task_id]["status"] == "Cancelled":
-            if os.path.exists(dest_file):
-                try: os.remove(dest_file)
+            if os.path.exists(temp_file):
+                try: os.remove(temp_file)
                 except Exception: pass
             return
 
         if ret == 0:
-            final_sz = os.path.getsize(dest_file) if os.path.exists(dest_file) else 0
+            if not os.path.exists(temp_file):
+                raise RuntimeError("curl exited successfully but no file was created")
+            os.replace(temp_file, dest_file)
+            final_sz = os.path.getsize(dest_file)
             download_tasks[task_id].update({
                 "status": "Completed",
                 "progress": 100,
@@ -773,13 +868,15 @@ def aria2_worker(task_id, target_url, dest_dir, custom_filename, token, is_start
     cmd = [
         "aria2c", "-x", "16", "-s", "16", "-k", "1M",
         "--content-disposition=true", "--allow-overwrite=true", "--auto-file-renaming=false",
-        "--summary-interval=1", "--console-log-level=notice", "--check-certificate=false",
-        "-d", dest_dir
+        "--summary-interval=1", "--console-log-level=notice", "--check-certificate=true",
+        "--max-tries=5", "--retry-wait=3", "--connect-timeout=15", "--timeout=30",
+        "--continue=true", "--file-allocation=none", "-d", dest_dir
     ]
     if "huggingface.co" in url and token:
         cmd.extend(["--header", f"Authorization: Bearer {token.strip()}"])
     if custom_filename.strip():
-        cmd.extend(["-o", custom_filename.strip()])
+        custom_filename = safe_filename(custom_filename.strip())
+        cmd.extend(["-o", custom_filename])
     cmd.append(url)
 
     download_tasks[task_id].update({
@@ -873,7 +970,7 @@ def trigger_startup_downloads():
 
         hf_token = get_setting("hf_token", "")
         civitai_token = get_setting("civitai_token", "")
-        task_id = str(len(download_tasks) + 1)
+        task_id = uuid.uuid4().hex[:12]
         is_civitai = "civitai." in url_target
         is_hf = "huggingface.co" in url_target
 
@@ -904,7 +1001,8 @@ def trigger_startup_downloads():
             "total_bytes": item.get("total_bytes", 0),
             "speed": "--",
             "eta": "Queued",
-            "error_log": ""
+            "error_log": "",
+            "attempt": 0
         }
         download_queue.put((task_id, url_target, dest_dir, filename, token, meta, download_type, True))
 
@@ -937,6 +1035,21 @@ def dispatch_instance_boot_alert():
 threading.Thread(target=dispatch_instance_boot_alert, daemon=True).start()
 
 class ManagerHandler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        logger.info("http %s - %s", self.address_string(), fmt % args)
+
+    def _require_auth(self):
+        if not AUTH_PASSWORD:
+            return True
+        expected = "Basic " + base64.b64encode(f"{AUTH_USER}:{AUTH_PASSWORD}".encode()).decode()
+        if self.headers.get("Authorization", "") == expected:
+            return True
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="Comfy-Xtra"')
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        return False
+
     def _send_json(self, data, status=200):
         body = json.dumps(data).encode("utf-8")
         self.send_response(status)
@@ -946,6 +1059,8 @@ class ManagerHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        if not self._require_auth():
+            return
         url = urllib.parse.urlparse(self.path)
         if url.path == "/":
             self.serve_ui()
@@ -956,7 +1071,7 @@ class ManagerHandler(BaseHTTPRequestHandler):
                 if os.path.exists(folder):
                     for f in os.listdir(folder):
                         full = os.path.join(folder, f)
-                        if os.path.isfile(full) and not f.endswith((".aria2", ".crdownload", ".tmp")) and not f.startswith(".tmp_"):
+                        if os.path.isfile(full) and not f.endswith((".aria2", ".crdownload", ".tmp", ".part")) and not f.startswith(".tmp_"):
                             models[cat].append({"name": f, "size": human_size(os.path.getsize(full))})
             self._send_json(models)
         elif url.path == "/api/disk":
@@ -971,6 +1086,8 @@ class ManagerHandler(BaseHTTPRequestHandler):
                 })
             except Exception:
                 self._send_json({"total": "--", "used": "--", "free": "--", "percent": 0})
+        elif url.path == "/api/health":
+            self._send_json({"ok": True, "service": "comfy-xtra", "time": int(time.time())})
         elif url.path == "/api/settings":
             self._send_json(get_all_settings())
         elif url.path == "/api/groups":
@@ -1004,10 +1121,16 @@ class ManagerHandler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
+        if not self._require_auth():
+            return
         url = urllib.parse.urlparse(self.path)
         length = int(self.headers.get("Content-Length", 0))
         raw_data = self.rfile.read(length).decode("utf-8") if length > 0 else "{}"
-        payload = json.loads(raw_data) if raw_data else {}
+        try:
+            payload = json.loads(raw_data) if raw_data else {}
+        except json.JSONDecodeError:
+            self._send_json({"error": "Invalid JSON"}, 400)
+            return
 
         if url.path == "/api/settings":
             save_settings(payload)
@@ -1068,8 +1191,12 @@ class ManagerHandler(BaseHTTPRequestHandler):
             old_cat = payload.get("old_category")
             new_cat = payload.get("new_category")
             filename = payload.get("filename")
-            src_file = os.path.join(TARGET_DIRS.get(old_cat, ""), filename)
-            dst_file = os.path.join(TARGET_DIRS.get(new_cat, ""), filename)
+            try:
+                src_file = safe_model_path(old_cat, filename)
+                dst_file = safe_model_path(new_cat, filename)
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, 400)
+                return
             if os.path.exists(src_file) and not os.path.exists(dst_file):
                 shutil.move(src_file, dst_file)
                 self._send_json({"ok": True})
@@ -1079,9 +1206,12 @@ class ManagerHandler(BaseHTTPRequestHandler):
             cat = payload.get("category")
             old_name = payload.get("old_name")
             new_name = payload.get("new_name", "").strip()
-            folder = TARGET_DIRS.get(cat, "")
-            old_path = os.path.join(folder, old_name)
-            new_path = os.path.join(folder, new_name)
+            try:
+                old_path = safe_model_path(cat, old_name)
+                new_path = safe_model_path(cat, new_name)
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, 400)
+                return
             if os.path.exists(old_path) and not os.path.exists(new_path):
                 shutil.move(old_path, new_path)
                 self._send_json({"ok": True})
@@ -1092,7 +1222,7 @@ class ManagerHandler(BaseHTTPRequestHandler):
             for folder in TARGET_DIRS.values():
                 if os.path.exists(folder):
                     for f in os.listdir(folder):
-                        if f.endswith((".aria2", ".crdownload", ".tmp")) or f.startswith(".tmp_"):
+                        if f.endswith((".aria2", ".crdownload", ".tmp", ".part")) or f.startswith(".tmp_"):
                             full = os.path.join(folder, f)
                             try:
                                 if os.path.isdir(full):
@@ -1144,7 +1274,16 @@ class ManagerHandler(BaseHTTPRequestHandler):
             url_target = payload.get("url", "").strip()
             category = payload.get("category", "loras")
             custom_name = payload.get("filename", "").strip()
-            dest_dir = TARGET_DIRS.get(category, TARGET_DIRS["loras"])
+            if category not in TARGET_DIRS:
+                self._send_json({"error": "Invalid category"}, 400)
+                return
+            if custom_name:
+                try:
+                    custom_name = safe_filename(custom_name)
+                except ValueError as exc:
+                    self._send_json({"error": str(exc)}, 400)
+                    return
+            dest_dir = TARGET_DIRS[category]
 
             if custom_name and os.path.exists(os.path.join(dest_dir, custom_name)):
                 self._send_json({"task_id": None, "skipped": True, "message": "File already exists on disk"})
@@ -1152,7 +1291,7 @@ class ManagerHandler(BaseHTTPRequestHandler):
 
             hf_token = get_setting("hf_token", "")
             civitai_token = get_setting("civitai_token", "")
-            task_id = str(len(download_tasks) + 1)
+            task_id = uuid.uuid4().hex[:12]
             is_civitai = "civitai." in url_target
             is_hf = "huggingface.co" in url_target
             meta = payload.get("meta")
@@ -1182,7 +1321,8 @@ class ManagerHandler(BaseHTTPRequestHandler):
                 "total_bytes": (meta.get("total_bytes") if meta else 0) or 0,
                 "speed": "--",
                 "eta": "Queued",
-                "error_log": ""
+                "error_log": "",
+                "attempt": 0
             }
             download_queue.put((task_id, url_target, dest_dir, custom_name, token, meta, download_type, False))
             self._send_json({"task_id": task_id})
@@ -1205,7 +1345,11 @@ class ManagerHandler(BaseHTTPRequestHandler):
         elif url.path == "/api/delete":
             category = payload.get("category")
             filename = payload.get("filename")
-            target = os.path.join(TARGET_DIRS.get(category, ""), filename)
+            try:
+                target = safe_model_path(category, filename)
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, 400)
+                return
             if os.path.exists(target) and os.path.isfile(target):
                 os.remove(target)
                 self._send_json({"ok": True})
@@ -2384,26 +2528,86 @@ class ManagerHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 if __name__ == "__main__":
+    ThreadingHTTPServer.allow_reuse_address = True
     server = ThreadingHTTPServer(("0.0.0.0", 17890), ManagerHandler)
-    server.serve_forever()
+    logger.info("Comfy-Xtra listening on :17890 (auth=%s)", "enabled" if AUTH_PASSWORD else "disabled")
+    try:
+        server.serve_forever(poll_interval=0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
 PY_EOF
 
-# 7. Release previous port binding & background cleanly
+"$PYTHON_BIN" -m py_compile /opt/x-dashboard.py
+
+cat <<'SUP_EOF' > /usr/local/bin/comfy-xtra-supervisor.sh
+#!/bin/bash
+set -u
+ENV_FILE=/workspace/.comfy_xtra.env
+LOG=/var/log/comfy-xtra.log
+[[ -f "$ENV_FILE" ]] && source "$ENV_FILE"
+if [[ -x /venv/main/bin/python ]]; then PY=/venv/main/bin/python
+elif [[ -x /opt/conda/bin/python ]]; then PY=/opt/conda/bin/python
+else PY="$(command -v python3)"
+fi
+backoff=2
+while true; do
+  printf '%s starting dashboard\n' "$(date -Is)" >>"$LOG"
+  "$PY" /opt/x-dashboard.py >>"$LOG" 2>&1
+  rc=$?
+  printf '%s dashboard exited rc=%s; restarting in %ss\n' "$(date -Is)" "$rc" "$backoff" >>"$LOG"
+  sleep "$backoff"
+  (( backoff < 60 )) && backoff=$((backoff*2))
+done
+SUP_EOF
+chmod 700 /usr/local/bin/comfy-xtra-supervisor.sh
+
+# Replace prior supervisor/dashboard cleanly.
+pkill -f '/usr/local/bin/comfy-xtra-supervisor.sh' >/dev/null 2>&1 || true
 fuser -k 17890/tcp >/dev/null 2>&1 || true
+nohup /usr/local/bin/comfy-xtra-supervisor.sh </dev/null >/dev/null 2>&1 &
+SUP_PID=$!
 
-nohup "${PYTHON_BIN}" /opt/x-dashboard.py </dev/null > /var/log/comfy-xtra.log 2>&1 &
-disown -h $!
+# Do not report success until the service is actually accepting authenticated requests.
+ready=0
+for _ in $(seq 1 90); do
+  if curl -fsS -u "$COMFY_XTRA_USER:$COMFY_XTRA_PASSWORD" --connect-timeout 2 http://127.0.0.1:17890/api/health >/dev/null 2>&1; then ready=1; break; fi
+  if ! kill -0 "$SUP_PID" >/dev/null 2>&1; then break; fi
+  sleep 2
+done
 
-send_discord "🚀 Comfy-Xtra Online" "Dashboard listening on port \`17890\`." 238636
-echo "Comfy-Xtra started on background pid $!"
+if [[ "$ready" != 1 ]]; then
+  log "ERROR: dashboard failed readiness check"
+  tail -100 "$DASH_LOG" || true
+  send_discord "❌ Provisioning Failed" "Dashboard failed its readiness check. Inspect /var/log/comfy-xtra.log." 15158332
+  exit 1
+fi
+
+log "Comfy-Xtra ready on port 17890; user=$COMFY_XTRA_USER password stored at $PASS_FILE"
+send_discord "🚀 Comfy-Xtra Online" "Dashboard passed health check on port `17890`." 238636
+exit 0
 PROV_EOF
 
-# Strip Windows line endings (\r) from staged payload
-sed -i 's/\r$//' /tmp/run_comfy_xtra_provision.sh 2>/dev/null || true
-chmod +x /tmp/run_comfy_xtra_provision.sh
+chmod 700 "$STAGED"
 
-# Launch the runner detached
-nohup /tmp/run_comfy_xtra_provision.sh </dev/null >/dev/null 2>&1 &
-
-# Exit with code 0 immediately to mark cloud template provisioning complete
-exit 0
+# Run provisioning synchronously with bounded self-rescheduling.
+attempt=1
+delay=5
+while [ "$attempt" -le 4 ]; do
+  if /bin/bash "$STAGED"; then
+    echo "Comfy-Xtra provisioning completed successfully."
+    echo "Dashboard username: ${COMFY_XTRA_USER:-admin}"
+    echo "Dashboard password is stored in /workspace/.comfy_xtra_password"
+    exit 0
+  fi
+  rc=$?
+  if [ "$attempt" -ge 4 ]; then
+    echo "Comfy-Xtra provisioning failed after $attempt attempts (rc=$rc)." >&2
+    exit "$rc"
+  fi
+  echo "Provision attempt $attempt failed; self-rescheduling in ${delay}s..." >&2
+  sleep "$delay"
+  delay=$((delay * 2))
+  attempt=$((attempt + 1))
+done
