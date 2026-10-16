@@ -1,5 +1,6 @@
 import { defineStore } from 'pinia'
 import { api } from '../lib/api'
+import { notify } from '../lib/notify'
 
 const ACTIVE = new Set(['queued', 'starting', 'downloading', 'verifying'])
 
@@ -18,6 +19,13 @@ export const useApp = defineStore('app', {
     modelsLoaded: false,
     toasts: [],
     galleryTick: 0,      // bumped when ComfyUI writes new outputs
+    health: null,        // host health result
+    healthRunning: false,
+    bench: { running: false, step: '', error: '' },
+    autostop: null,      // auto-stop status
+    backup: null,        // backup status
+    update: null,        // in-place update info
+    paletteOpen: false,
   }),
 
   getters: {
@@ -36,6 +44,9 @@ export const useApp = defineStore('app', {
         for (const t of this.boot.downloads || []) this.downloads[t.id] = t
         await Promise.all([this.loadLibrary(), this.loadBundles()])
         this.ready = true
+        api.get('health/host').then((h) => { this.health = h.result; this.healthRunning = h.running }).catch(() => {})
+        api.get('autostop').then((a) => (this.autostop = a)).catch(() => {})
+        this.checkUpdate()
       } catch (e) {
         this.bootError = e.message
       }
@@ -58,9 +69,11 @@ export const useApp = defineStore('app', {
         if (prev && prev.status !== t.status) {
           if (t.status === 'done' && !t.error) {
             this.toast(`Installed ${t.filename}`, 'success')
+            notify('Download finished', t.filename)
             this.loadModels(); this.loadLibrary()
           } else if (t.status === 'failed') {
             this.toast(`Download failed: ${t.filename}`, 'error', t.error)
+            notify('Download failed', `${t.filename}: ${t.error}`)
           }
         }
       })
@@ -72,6 +85,13 @@ export const useApp = defineStore('app', {
       on('models', () => this.loadModels())
       on('settings', (s) => { this.boot.settings = s })
       on('outputs', () => { this.galleryTick++ })
+      on('health', (h) => { this.healthRunning = h.running; if (h.result) this.health = h.result })
+      on('benchmark', (b) => { this.bench = b })
+      on('backup', (b) => { this.backup = { ...(this.backup || {}), ...b } })
+      on('autostop', (a) => {
+        if (a.warned && !this.autostop?.warned) notify('Instance idle', 'It will stop soon to save money. Open Comfy-Xtra to keep it running.')
+        this.autostop = { ...(this.autostop || {}), ...a }
+      })
       on('data', (d) => {
         if (d.collections.includes('library')) this.loadLibrary()
         if (d.collections.includes('bundles')) this.loadBundles()
@@ -81,6 +101,9 @@ export const useApp = defineStore('app', {
 
     async loadLibrary() { this.library = await api.get('library') },
     async loadBundles() { this.bundles = await api.get('bundles') },
+    async checkUpdate(force = false) {
+      try { this.update = await api.get('update', force ? { force: 1 } : {}) } catch { /* offline */ }
+    },
     async loadModels() { this.models = await api.get('models'); this.modelsLoaded = true },
 
     toast(title, kind = 'info', detail = '') {

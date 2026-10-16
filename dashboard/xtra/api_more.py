@@ -22,6 +22,14 @@ async def fix_plan(request):
     return ok(await asyncio.to_thread(fixer.plan, wf, st.all("library"), st.settings(), b.get("missing_nodes") or []))
 
 
+@routes.get("/api/workflows/comfy/raw")
+async def workflow_raw(request):
+    """A workflow saved in ComfyUI's user data, as JSON."""
+    import urllib.parse
+    path = request.query["path"]
+    return ok(await system.comfy_get("/api/userdata/" + urllib.parse.quote(f"workflows/{path}", safe="")))
+
+
 @routes.post("/api/fix/apply")
 async def fix_apply(request):
     """Body: {models: [{filename, category, fix}], packs: [pack ids]}. Queues everything at once."""
@@ -146,7 +154,7 @@ async def autostop_status(request):
 @routes.post("/api/autostop/snooze")
 async def autostop_snooze(request):
     b = await _body(request) if request.can_read_body else {}
-    autostop.snooze(b.get("minutes"))
+    autostop.snooze(_store(request), b.get("minutes"))
     return ok(autostop.status(_store(request)))
 
 

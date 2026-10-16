@@ -20,12 +20,12 @@ WARN_BEFORE = 5 * 60
 _state = {"idle_since": time.time(), "warned": False, "stopping": False, "snoozed_until": 0.0}
 
 
-def snooze(minutes=None):
+def snooze(store, minutes=None):
     _state["idle_since"] = time.time()
     _state["warned"] = False
     if minutes:
         _state["snoozed_until"] = time.time() + minutes * 60
-    bus.publish("autostop", status(None))
+    bus.publish("autostop", status(store))
 
 
 def status(store):

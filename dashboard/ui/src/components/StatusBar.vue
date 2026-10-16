@@ -4,9 +4,10 @@ import { Cpu, Download, ExternalLink, CircleDollarSign, Play, CircleDot } from '
 import { useApp } from '../stores/app'
 import { route } from '../lib/route'
 import { bytes, speed } from '../lib/format'
+import { embedded } from '../lib/bridge'
 
 const app = useApp()
-const titles = { library: 'Library', discover: 'Discover', workflows: 'Workflows', downloads: 'Downloads', gallery: 'Gallery', monitor: 'Monitor', settings: 'Settings' }
+const titles = { library: 'Library', discover: 'Discover', fix: 'Fixer', downloads: 'Downloads', gallery: 'Gallery', monitor: 'Monitor', settings: 'Settings' }
 
 const gpu = computed(() => app.system?.gpus?.[0])
 const comfy = computed(() => app.comfy || {})
@@ -20,7 +21,7 @@ const dlSpeed = computed(() => app.activeDownloads.reduce((s, t) => s + (t.speed
 // Vast maps ComfyUI's port 8188 to a random public port; the backend reports it, and
 // ComfyUI is behind the same portal (same host and protocol) as this page.
 const comfyHref = computed(() =>
-  app.boot.comfy_port ? `${location.protocol}//${location.hostname}:${app.boot.comfy_port}/` : '')
+  !embedded && app.boot.comfy_port ? `${location.protocol}//${location.hostname}:${app.boot.comfy_port}/` : '')
 </script>
 
 <template>

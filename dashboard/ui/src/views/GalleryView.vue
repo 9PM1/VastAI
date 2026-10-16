@@ -1,7 +1,8 @@
 <script setup>
 import { computed, onMounted, ref, watch } from 'vue'
-import { Search, Star, CheckSquare, Square, Download, Trash2, Images, Film, X, PlayCircle } from '@lucide/vue'
+import { Search, Star, CheckSquare, Square, Download, Trash2, Images, Film, X, PlayCircle, CloudUpload } from '@lucide/vue'
 import { api, downloadZip } from '../lib/api'
+import { go } from '../lib/route'
 import { bytes } from '../lib/format'
 import { useApp } from '../stores/app'
 import Btn from '../components/ui/Btn.vue'
@@ -50,6 +51,13 @@ function toggle(it) {
   selected.value = s
 }
 function open(i, it) { selecting.value ? toggle(it) : (viewer.value = i) }
+const backingUp = ref(false)
+async function backupNow() {
+  if (!app.settings.backup_repo) { go('settings', { section: 'backup' }); return }
+  backingUp.value = true
+  try { const r = await api.post('backup/run'); app.toast(r.files ? `Backed up ${r.files} file(s)` : 'Nothing new to back up', 'success') }
+  catch (e) { app.toast(e.message, 'error') } finally { backingUp.value = false }
+}
 function exitSelect() { selecting.value = false; selected.value = new Set() }
 async function star(it) {
   it.starred = !it.starred
@@ -81,6 +89,7 @@ function onDeleted(path) {
       </div>
       <Btn :variant="starred ? 'primary' : 'secondary'" size="md" :aria-pressed="starred" @click="starred = !starred"><Star class="size-4" /> Starred</Btn>
       <span class="ml-auto text-xs text-fg2 tabular">{{ total }} files · {{ bytes(totalSize) }}</span>
+      <Btn :loading="backingUp || app.backup?.running" :title="app.settings.backup_repo ? `Back up new outputs to ${app.settings.backup_repo}` : 'Set up output backup'" @click="backupNow"><CloudUpload class="size-4" /> Back up</Btn>
       <Btn v-if="!selecting" :disabled="!items.length" @click="selecting = true"><CheckSquare class="size-4" /> Select</Btn>
     </div>
 

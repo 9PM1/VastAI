@@ -57,6 +57,9 @@ window.addEventListener("message", async (e) => {
     scheduleAnalyze([]);
   } else if (type === "xtra:reanalyze") {
     scheduleAnalyze([]);
+  } else if (type === "xtra:reload") {
+    // After new node packs: ComfyUI was restarted, reload so their nodes and UI appear.
+    location.reload();
   }
 });
 
