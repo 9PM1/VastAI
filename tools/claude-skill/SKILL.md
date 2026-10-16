@@ -37,6 +37,8 @@ python xtra.py stop|start|destroy ID
   fast disk, no display attached, ≥ 32 GB RAM, CUDA ≥ 12.9), hides hosts scoring well below others with the
   same GPU (power-limited or throttled; HOST column) and machines that failed a host check in the last 30 days.
   Prices are real costs: GPU + disk per hour plus the host's download fee for the models, spread over `--hours`.
+  Hosts charging over $10/TB to download are hidden (some charge $40+/TB); only raise `--max-download-per-tb`
+  if the user asks, and always say a host's $/TB when recommending it.
   `--rank value` (default) = most images per dollar; `--rank speed` = fastest within `--max-price`. If the user
   names a workflow, pass `--for` so VRAM and download size come from it; otherwise ask what they'll run.
   IMG/H marked `~` is an estimate from a built-in speed table; unmarked numbers are the user's own benchmarks.

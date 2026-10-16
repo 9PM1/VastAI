@@ -73,7 +73,7 @@ class Ranking(unittest.TestCase):
         self.assertIn(3, [o["id"] for o in ranked])
 
     def test_download_fee_counts(self):
-        ranked, _ = xtra.rank_offers([dict(o) for o in self.offers], [], download_gb=50, hours=4)
+        ranked, _ = xtra.rank_offers([dict(o) for o in self.offers], [], download_gb=50, hours=4, max_download_per_tb=None)
         by = {o["id"]: o for o in ranked}
         self.assertAlmostEqual(by[2]["_fee"], 0.78, places=2)
         self.assertGreater(by[2]["_cost_h"], by[1]["_cost_h"])  # "cheaper" listing is dearer in practice
@@ -93,6 +93,14 @@ class Ranking(unittest.TestCase):
         self.assertEqual(speed[0]["id"], 4)  # fastest healthy 5090
         by = {o["id"]: o for o in speed}
         self.assertAlmostEqual(by[4]["_ips"] / by[5]["_ips"], 1.35 / .38, delta=0.05)
+
+    def test_expensive_bandwidth_hidden(self):
+        offers = [dict(o) for o in self.offers] + [offer(6, "RTX 5090", 200, 0.50, 16, fee=0.039)]  # $39/TB
+        ranked, hidden = xtra.rank_offers(offers, [], download_gb=20)
+        self.assertNotIn(6, [o["id"] for o in ranked])
+        self.assertEqual(hidden["bandwidth"], 2)  # offer 2 charges $15.6/TB too
+        ranked, _ = xtra.rank_offers([dict(o) for o in offers], [], max_download_per_tb=None)
+        self.assertIn(6, [o["id"] for o in ranked])
 
     def test_bad_hosts_skipped(self):
         ranked, hidden = xtra.rank_offers([dict(o) for o in self.offers], [], bad={"11": {}})
