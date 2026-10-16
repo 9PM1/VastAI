@@ -4,8 +4,11 @@
 COMFY_PY=/venv/main/bin/python
 SAGE_VERSION=2.2.0
 SAGE_COMMIT=d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5
-# Archs SageAttention 2.2 supports: A100, RTX 30, RTX 40/L40, H100, B200, RTX 50.
-SAGE_ARCHS="8.0;8.6;8.9;9.0;10.0;12.0"
+# Archs for the prebuilt wheel: A100, RTX 30, RTX 40/L4/L40, RTX 50. Not 9.0/10.0:
+# at this commit setup.py applies every -gencode to the Hopper-only sm90 kernels,
+# so mixing 9.0 with any other arch fails (wgmma is not available on sm_100a).
+# H100/B200 still get SageAttention through the single-arch source build.
+SAGE_ARCHS="8.0;8.6;8.9;12.0"
 
 sage_smoke_test(){
   "$COMFY_PY" - <<'PYSAGE'
