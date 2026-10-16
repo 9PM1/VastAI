@@ -56,7 +56,7 @@ async def fix_apply(request):
     if moves:
         bus.publish("models", {})
     return ok({"tasks": tasks, "moves": moves, "packs": packs, "errors": errors,
-               "restart_needed": any(v == "queued" for v in packs.values())})
+               "restart_needed": any(v in ("queued", "installed") for v in packs.values())})
 
 
 @routes.post("/api/fix/use")

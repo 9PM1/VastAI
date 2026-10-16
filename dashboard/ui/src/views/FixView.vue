@@ -257,7 +257,8 @@ const addOpen = ref(false)
               <p v-if="!n.pack" class="mt-0.5 text-[11px] text-danger-hover">{{ n.note || 'No node pack in ComfyUI-Manager provides this node' }}</p>
             </div>
             <template v-if="n.pack">
-              <Tag v-if="packs[n.pack.id]" :tone="packs[n.pack.id] === 'queued' ? 'primary' : packs[n.pack.id] === 'already installed' ? 'ok' : 'danger'">{{ packs[n.pack.id] === 'queued' ? 'Installing' : packs[n.pack.id] }}</Tag>
+              <Tag v-if="packs[n.pack.id]" :tone="packs[n.pack.id] === 'queued' ? 'primary' : ['already installed', 'installed'].includes(packs[n.pack.id]) ? 'ok' : 'danger'" :title="packs[n.pack.id]">{{ packs[n.pack.id] === 'queued' ? 'Installing' : packs[n.pack.id] === 'installed' ? 'Installed, restart ComfyUI' : packs[n.pack.id].length > 40 ? 'Not installed' : packs[n.pack.id] }}</Tag>
+              <p v-if="packs[n.pack.id] && packs[n.pack.id].length > 40" class="w-full text-[11px] text-danger-hover">{{ packs[n.pack.id] }}</p>
               <Tag v-else-if="['enabled', 'installed'].includes(n.pack.state)" tone="warn">Installed, needs restart</Tag>
               <Btn v-else size="sm" @click="installPack(n.pack.id)"><Download class="size-3.5" /> Install pack</Btn>
             </template>

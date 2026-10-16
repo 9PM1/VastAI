@@ -248,6 +248,15 @@ class WorkflowHints(unittest.TestCase):
         p = fixer._pack_from_notes("DaSiWa_Watermark", hints, {})
         self.assertEqual(p["git_url"], "https://github.com/darksidewalker/ComfyUI-DaSiWa-Nodes")
         self.assertIsNone(fixer._pack_from_notes("SomethingElse", {"github": []}, {}))
+        # Once the DaSiWa pack is installed, a DaSiWa-named type isn't blamed on another linked pack.
+        two = {"github": hints["github"] + [{"url": "https://github.com/city96/ComfyUI-GGUF", "owner": "city96", "repo": "ComfyUI-GGUF"}]}
+        installed = {"dasiwa": {"id": "dasiwa", "repository": "https://github.com/darksidewalker/ComfyUI-DaSiWa-Nodes", "state": "enabled"}}
+        self.assertIsNone(fixer._pack_from_notes("Lable (DaSiWa)", two, installed))
+
+    def test_display_only_nodes_are_not_missing(self):
+        wf = {"nodes": [{"id": 1, "type": "Lable (DaSiWa)", "inputs": [], "outputs": [], "properties": {}},
+                        {"id": 2, "type": "DaSiWa_Watermark", "inputs": [{"name": "image"}], "outputs": [{"name": "IMAGE"}]}]}
+        self.assertEqual(list(fixer.workflow_node_types(wf)), ["DaSiWa_Watermark"])
 
 
 class ModelPaths(unittest.TestCase):

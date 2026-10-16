@@ -598,6 +598,8 @@ def workflow_node_types(workflow):
                 t = n.get("type")
                 if not t or t in subgraph_ids or t in FRONTEND_ONLY or t.startswith("workflow>"):
                     continue
+                if not n.get("inputs") and not n.get("outputs") and "inputs" in n and "outputs" in n:
+                    continue  # no inputs or outputs: a display-only node drawn by JavaScript (labels, notes)
                 cnr = (n.get("properties") or {}).get("cnr_id")
                 if cnr and cnr != "comfy-core":
                     out[t] = cnr
@@ -651,14 +653,14 @@ def _pack_from_notes(node_type, hints, packs):
     for g in (hints or {}).get("github") or []:
         info = _pack_info(g["url"], packs) or {"id": g["url"], "key": g["url"], "title": g["repo"], "repository": g["url"],
                                                "state": "not-installed", "version": "unknown", "git_url": g["url"]}
-        if info.get("state") in ("enabled", "installed"):
-            continue
         words = [w for w in re.split(r"[^a-z0-9]+", g["repo"].lower()) if len(w) >= 4 and w not in ("comfyui", "nodes", "node", "custom", "pack", "suite")]
-        linked.append((any(w in node_type.lower() for w in words), info))
-    named = [i for hit, i in linked if hit]
+        linked.append((any(w in node_type.lower() for w in words), info.get("state") in ("enabled", "installed"), info))
+    named = [(installed, i) for hit, installed, i in linked if hit]
     if named:
-        return named[0]
-    return linked[0][1] if len(linked) == 1 else None
+        # Named after a linked pack: that pack, unless it's installed already (then it isn't a pack problem).
+        return None if any(installed for installed, _i in named) else named[0][1]
+    missing = [i for _hit, installed, i in linked if not installed]
+    return missing[0] if len(missing) == 1 else None
 
 
 def _pack_summary(p):
@@ -676,8 +678,15 @@ def install_packs(pack_ids):
     for pid in dict.fromkeys(pack_ids):
         p = _pack_info(pid, packs)
         if not p and re.match(r"https://github\.com/[\w.\-]+/[\w.\-]+$", pid):
-            r = requests.post(config.COMFY_URL + "/customnode/install/git_url", data=pid, timeout=300)
-            results[pid] = "installed" if r.ok else f"refused ({r.status_code}): {r.text[:160] or 'ComfyUI-Manager blocks installs from a git URL at this security level'}"
+            # Not in Manager's registry: Manager installs it from the git URL only if allowed in its config.
+            r = requests.post(config.COMFY_URL + "/customnode/install/git_url", json={"url": pid}, timeout=600)
+            if r.ok:
+                results[pid] = "installed"
+            elif r.status_code == 403:
+                results[pid] = ("ComfyUI-Manager only installs packs that aren't in its registry when allow_git_url_install = True "
+                                "is set in ComfyUI/user/__manager/config.ini; set it and restart ComfyUI, or install the pack by hand")
+            else:
+                results[pid] = f"install failed ({r.status_code}): {r.text[:160]}"
             continue
         if not p:
             results[pid] = "not found in ComfyUI-Manager's list"
