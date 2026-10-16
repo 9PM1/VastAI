@@ -14,6 +14,9 @@ LOCAL_DB = DATA_DIR / "xtra.db"
 LEGACY_DB = WORKSPACE / "model_manager.db"
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 
+# Optional Vast volume holding the model folders (survives destroying the instance).
+MODEL_VOLUME = Path(os.environ["XTRA_MODEL_VOLUME"]) if os.environ.get("XTRA_MODEL_VOLUME") else None
+
 PORT = int(os.environ.get("XTRA_PORT", "17890"))
 # Port 8188 is Vast's authenticated Caddy proxy; ComfyUI itself listens on 18188.
 COMFY_URL = (os.environ.get("COMFYUI_API_BASE") or "http://127.0.0.1:18188").rstrip("/")
@@ -79,6 +82,17 @@ def normalize_category(value, default="loras"):
     if v in CATEGORY_NAMES:
         return v
     return CATEGORY_ALIASES.get(v, default)
+
+
+def staging_root(target):
+    """Staging folder on the same filesystem as target, so the final move is an atomic rename."""
+    if MODEL_VOLUME and MODEL_VOLUME.is_dir():
+        try:
+            if Path(target).resolve().is_relative_to(MODEL_VOLUME.resolve()):
+                return MODEL_VOLUME / ".xtra-staging"
+        except (OSError, ValueError):
+            pass
+    return STAGING_DIR
 
 
 def ensure_dirs():

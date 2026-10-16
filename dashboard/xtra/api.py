@@ -2,6 +2,7 @@
 import asyncio
 import json
 import os
+import re
 
 from aiohttp import web
 
@@ -85,7 +86,15 @@ async def bootstrap_data(app):
         "comfy_url": config.COMFY_URL,
         # Public port Vast mapped to ComfyUI (8188 via the portal); the browser builds the link.
         "comfy_port": os.environ.get("VAST_TCP_PORT_8188", ""),
+        "installed": _installed_version(),
+        "model_volume": str(config.MODEL_VOLUME) if config.MODEL_VOLUME and config.MODEL_VOLUME.is_dir() else "",
+        "embedded_proxy": True,
     }
+
+
+def _installed_version():
+    from . import updater
+    return updater.installed()
 
 
 @routes.get("/api/health")
@@ -126,6 +135,15 @@ async def put_settings(request):
             changes[key] = max(1, min(8, int(value)))
         elif key in ("verify_hashes", "show_nsfw", "notify_downloads"):
             changes[key] = bool(value)
+        elif key == "auto_stop_minutes":
+            changes[key] = max(0, min(24 * 60, int(value or 0)))
+        elif key == "backup_auto":
+            changes[key] = bool(value)
+        elif key == "backup_repo":
+            v = str(value or "").strip().removeprefix("https://huggingface.co/datasets/").strip("/")
+            if v and not re.fullmatch(r"[\w.\-]+/[\w.\-]+", v):
+                raise ValueError("Backup repo should look like your-name/comfy-outputs")
+            changes[key] = v
     await asyncio.to_thread(_store(request).update_settings, changes)
     settings = masked_settings(_store(request).settings())
     bus.publish("settings", settings)
@@ -212,36 +230,10 @@ async def library_install(request):
 
 @routes.post("/api/library/refresh")
 async def library_refresh(request):
-    """Re-fetch metadata (preview, size, hash, trigger words) from Civitai / Hugging Face."""
+    """Re-fetch metadata (preview, size, hash, trigger words); flags dead links."""
+    from . import library
     body = await _body(request) if request.can_read_body else {}
-    st = _store(request)
-    wanted = set(body.get("ids") or [])
-
-    def work():
-        settings, updated, failed = st.settings(), 0, []
-        for item in st.all("library"):
-            if wanted and item["id"] not in wanted:
-                continue
-            try:
-                cand = sources.resolve(item["url"], settings)
-            except Exception as exc:
-                failed.append({"id": item["id"], "name": item.get("name"), "error": str(exc)})
-                continue
-            if cand.get("source") == "hf-repo":
-                continue
-            for key in ("size", "sha256", "preview", "trigger_words", "base_model", "page_url", "civitai", "hf"):
-                if cand.get(key):
-                    item[key] = cand[key]
-            if cand.get("preview"):
-                item["preview_mature"] = bool(cand.get("preview_mature"))
-            if not item.get("filename"):
-                item["filename"] = cand.get("filename")
-            item["updated_at"] = now()
-            st.put("library", item)
-            updated += 1
-        return {"updated": updated, "failed": failed}
-
-    result = await asyncio.to_thread(work)
+    result = await asyncio.to_thread(library.refresh, _store(request), body.get("ids"))
     bus.publish("library", {"refreshed": True})
     return ok(result)
 
@@ -272,6 +264,8 @@ async def bundles_update(request):
     for key in ("name", "icon", "description"):
         if key in body:
             bundle[key] = body[key]
+    if "auto_install" in body:
+        bundle["auto_install"] = bool(body["auto_install"])
     await asyncio.to_thread(st.put, "bundles", bundle)
     bus.publish("bundles", {"changed": [bundle["id"]]})
     return ok(bundle)

@@ -115,7 +115,7 @@ class DownloadManager:
         proc = self.procs.pop(task_id, None)
         if proc and proc.returncode is None:
             proc.terminate()
-        shutil.rmtree(config.STAGING_DIR / task_id, ignore_errors=True)
+        shutil.rmtree(config.staging_root(task["target"]) / task_id, ignore_errors=True)
         self._emit(task)
         return True
 
@@ -158,7 +158,7 @@ class DownloadManager:
                 self.running -= 1
 
     async def _run(self, task):
-        staging = config.STAGING_DIR / task["id"]
+        staging = config.staging_root(task["target"]) / task["id"]
         staging.mkdir(parents=True, exist_ok=True)
         part = staging / task["filename"]
         while task["status"] in ACTIVE:
