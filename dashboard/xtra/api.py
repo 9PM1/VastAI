@@ -1,6 +1,7 @@
 """HTTP API. Every route is JSON under /api; blocking work runs in threads."""
 import asyncio
 import json
+import os
 
 from aiohttp import web
 
@@ -82,6 +83,8 @@ async def bootstrap_data(app):
         "downloads": app["downloads"].snapshot(),
         "engine": "aria2c" if app["downloads"].aria2 else "aiohttp",
         "comfy_url": config.COMFY_URL,
+        # Public port Vast mapped to ComfyUI (8188 via the portal); the browser builds the link.
+        "comfy_port": os.environ.get("VAST_TCP_PORT_8188", ""),
     }
 
 
@@ -195,7 +198,7 @@ async def library_delete(request):
 
 def _download_spec(item):
     return {"url": item["url"], "category": item["category"], "filename": item["filename"], "name": item["name"],
-            "preview": item.get("preview"), "size": item.get("size"), "sha256": item.get("sha256"),
+            "preview": item.get("preview"), "preview_mature": item.get("preview_mature"), "size": item.get("size"), "sha256": item.get("sha256"),
             "source": item.get("source"), "library_id": item["id"]}
 
 
@@ -229,6 +232,8 @@ async def library_refresh(request):
             for key in ("size", "sha256", "preview", "trigger_words", "base_model", "page_url", "civitai", "hf"):
                 if cand.get(key):
                     item[key] = cand[key]
+            if cand.get("preview"):
+                item["preview_mature"] = bool(cand.get("preview_mature"))
             if not item.get("filename"):
                 item["filename"] = cand.get("filename")
             item["updated_at"] = now()

@@ -91,12 +91,18 @@ def civitai_ids_from_url(url):
 
 
 def _pick_preview(images, show_nsfw):
-    for img in images or []:
-        if img.get("type", "image") != "image":
-            continue
-        if show_nsfw or (img.get("nsfwLevel") or 1) <= 1:
-            return img.get("url") or ""
-    return ""
+    """(url, mature) for a version's preview image.
+
+    Civitai rates images with nsfwLevel 1 (PG), 2 (PG-13), 4 (R), 8 (X), 16 (XXX).
+    With mature content hidden, prefer the safest image; if every image is mature,
+    still return one but flag it so the UI can blur it.
+    """
+    imgs = [i for i in images or [] if i.get("type", "image") == "image" and i.get("url")]
+    if not imgs:
+        return "", False
+    level = lambda i: i.get("nsfwLevel") or 1
+    pick = imgs[0] if show_nsfw else min(imgs, key=level)
+    return pick["url"], level(pick) >= 4
 
 
 def civitai_version(version_id, token="", file_id=None, show_nsfw=True):
@@ -108,6 +114,7 @@ def civitai_version(version_id, token="", file_id=None, show_nsfw=True):
     model = data.get("model") or {}
     mtype = (model.get("type") or "").lower()
     name = " - ".join(x for x in (model.get("name"), data.get("name")) if x) or f.get("name")
+    preview, mature = _pick_preview(data.get("images"), show_nsfw)
     return {
         "source": "civitai",
         "name": name,
@@ -116,7 +123,8 @@ def civitai_version(version_id, token="", file_id=None, show_nsfw=True):
         "category": CIVITAI_TYPE_TO_CATEGORY.get(mtype, "loras" if "lora" in mtype else "checkpoints"),
         "size": int(float(f.get("sizeKB") or 0) * 1024),
         "sha256": ((f.get("hashes") or {}).get("SHA256") or "").lower(),
-        "preview": _pick_preview(data.get("images"), show_nsfw),
+        "preview": preview,
+        "preview_mature": mature,
         "trigger_words": [w for w in data.get("trainedWords") or [] if w],
         "base_model": data.get("baseModel") or "",
         "model_type": model.get("type") or "",
@@ -134,10 +142,11 @@ def civitai_model(model_id, token="", show_nsfw=True):
     for v in data.get("modelVersions") or []:
         files = v.get("files") or []
         f = next((x for x in files if x.get("primary")), files[0] if files else {})
+        preview, mature = _pick_preview(v.get("images"), show_nsfw)
         versions.append({
             "version_id": v.get("id"), "name": v.get("name"), "base_model": v.get("baseModel") or "",
             "filename": f.get("name") or "", "size": int(float(f.get("sizeKB") or 0) * 1024),
-            "preview": _pick_preview(v.get("images"), show_nsfw), "published_at": v.get("publishedAt"),
+            "preview": preview, "preview_mature": mature, "published_at": v.get("publishedAt"),
         })
     return {"model_id": data.get("id"), "name": data.get("name"), "type": data.get("type"),
             "nsfw": bool(data.get("nsfw")), "creator": (data.get("creator") or {}).get("username"),
@@ -161,13 +170,14 @@ def civitai_search(query="", types=None, sort="Most Downloaded", base_model="", 
         files = v.get("files") or []
         f = next((x for x in files if x.get("primary")), files[0] if files else {})
         stats = m.get("stats") or {}
+        preview, mature = _pick_preview(v.get("images"), show_nsfw)
         items.append({
             "source": "civitai", "model_id": m.get("id"), "version_id": v.get("id"), "name": m.get("name"),
             "version_name": v.get("name"), "type": m.get("type"),
             "category": CIVITAI_TYPE_TO_CATEGORY.get((m.get("type") or "").lower(), "checkpoints"),
             "base_model": v.get("baseModel") or "", "filename": f.get("name") or "",
-            "size": int(float(f.get("sizeKB") or 0) * 1024), "preview": _pick_preview(v.get("images"), show_nsfw),
-            "nsfw": bool(m.get("nsfw")), "downloads": stats.get("downloadCount", 0), "likes": stats.get("thumbsUpCount", 0),
+            "size": int(float(f.get("sizeKB") or 0) * 1024), "preview": preview,
+            "preview_mature": mature, "nsfw": bool(m.get("nsfw")), "downloads": stats.get("downloadCount", 0), "likes": stats.get("thumbsUpCount", 0),
             "creator": (m.get("creator") or {}).get("username"),
             "page_url": f"https://civitai.com/models/{m.get('id')}",
         })
@@ -305,6 +315,7 @@ def library_item(candidate, overrides=None):
         "size": int(candidate.get("size") or 0),
         "sha256": candidate.get("sha256") or "",
         "preview": candidate.get("preview") or "",
+        "preview_mature": bool(candidate.get("preview_mature")),
         "trigger_words": candidate.get("trigger_words") or [],
         "base_model": candidate.get("base_model") or "",
         "page_url": candidate.get("page_url") or "",

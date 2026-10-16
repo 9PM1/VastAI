@@ -25,7 +25,19 @@ https://raw.githubusercontent.com/9PM1/VastAI/refs/heads/main/provis.sh
 | `tools/build-sage-wheel.sh` | Builds the multi-GPU SageAttention wheel published as a release. |
 | `dashboard/server.py` | Dashboard entry point (aiohttp, runs in ComfyUI's venv; binds 127.0.0.1:17890 behind the portal). |
 | `dashboard/xtra/` | Backend: `store` (SQLite + background MongoDB sync, v1 migration), `sources` (Civitai / Hugging Face), `downloads` (aria2 queue with resume + SHA-256 checks), `models`, `workflows` (missing-model finder), `system` (GPU / queue / Vast cost monitor), `gallery`, `api` (routes), `events` (live updates over SSE). |
-| `dashboard/web/` | Built web UI, served at `/` (falls back to a placeholder page when absent). |
+| `dashboard/ui/` | Web UI source: Vue 3 + Tailwind CSS 4 + reka-ui + Lucide, the same stack and design tokens as ComfyUI's frontend. |
+| `dashboard/web/` | Built web UI (committed, so instances need no Node), served at `/`. |
+
+## Editing the UI
+
+```bash
+cd dashboard/ui && npm install
+npm run dev     # hot-reload dev server; proxies /api to XTRA_API (default http://127.0.0.1:17891)
+npm run build   # writes ../web — commit it
+```
+
+Run the backend locally with `XTRA_WORKSPACE=<folder> python dashboard/server.py` (needs aiohttp,
+psutil, pillow, requests, huggingface_hub, pymongo, certifi, av).
 | `supervisor/` | supervisord program definition and launcher. |
 
 ## Template environment variables

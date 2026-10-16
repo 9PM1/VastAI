@@ -88,7 +88,7 @@ class DownloadManager:
         task = {
             "id": new_id(), "url": spec["url"], "source": spec.get("source") or "url",
             "name": spec.get("name") or filename, "filename": filename, "category": category,
-            "target": str(target), "preview": spec.get("preview") or "",
+            "target": str(target), "preview": spec.get("preview") or "", "preview_mature": bool(spec.get("preview_mature")),
             "size": int(spec.get("size") or 0), "done": 0, "speed": 0, "eta": "",
             "sha256": (spec.get("sha256") or "").lower(), "library_id": spec.get("library_id"),
             "status": "queued", "error": "", "attempt": 0, "auto": auto,

@@ -1,0 +1,92 @@
+@import 'tailwindcss';
+@import '@fontsource-variable/inter';
+
+/* Semantic tokens copied from ComfyUI's design system (packages/design-system/src/css),
+   so the dashboard reads as part of ComfyUI. Dark is the default, like ComfyUI. */
+:root {
+  --base-background: #171718;      /* charcoal-800: panels */
+  --canvas: #202020;               /* ComfyUI --bg-color */
+  --secondary-background: #262729; /* charcoal-600: cards, inputs */
+  --secondary-hover: #313235;      /* charcoal-400 */
+  --secondary-selected: #494a50;   /* charcoal-200 */
+  --border-default: #494a50;
+  --border-subtle: #3c3d42;
+  --stroke: #313235;
+  --text-primary: #ffffff;
+  --text-secondary: #a0a0a0;
+  --text-muted: #8a8a8a;
+  --primary: #0b8ce9;              /* azure-600 */
+  --primary-hover: #31b9f4;        /* azure-400 */
+  --primary-soft: rgb(11 140 233 / 0.16);
+  --destructive: #b33a3a;          /* coral-700 */
+  --destructive-hover: #e04e48;
+  --warning: #fd9903;              /* gold-600 */
+  --success: #00cd72;              /* jade-600 */
+  --overlay: rgb(0 0 0 / 0.6);
+  color-scheme: dark;
+}
+:root[data-theme='light'] {
+  --base-background: #ffffff;
+  --canvas: #f3f3f3;
+  --secondary-background: #e9e9e9;
+  --secondary-hover: #d9d9d9;
+  --secondary-selected: #b4b4b4;
+  --border-default: #b4b4b4;
+  --border-subtle: #d9d9d9;
+  --stroke: #e1e1e1;
+  --text-primary: #202121;
+  --text-secondary: #636363;
+  --text-muted: #8a8a8a;
+  --primary: #0b8ce9;
+  --primary-hover: #185a8b;
+  --primary-soft: rgb(11 140 233 / 0.12);
+  --destructive: #e04e48;
+  --destructive-hover: #b33a3a;
+  --warning: #c77700;
+  --success: #00a85e;
+  --overlay: rgb(0 0 0 / 0.35);
+  color-scheme: light;
+}
+
+@theme inline {
+  --font-sans: 'Inter Variable', 'Inter', ui-sans-serif, system-ui, sans-serif;
+  --color-panel: var(--base-background);
+  --color-canvas: var(--canvas);
+  --color-card: var(--secondary-background);
+  --color-hover: var(--secondary-hover);
+  --color-selected: var(--secondary-selected);
+  --color-border: var(--border-default);
+  --color-subtle: var(--border-subtle);
+  --color-stroke: var(--stroke);
+  --color-fg: var(--text-primary);
+  --color-fg2: var(--text-secondary);
+  --color-muted: var(--text-muted);
+  --color-primary: var(--primary);
+  --color-primary-hover: var(--primary-hover);
+  --color-primary-soft: var(--primary-soft);
+  --color-danger: var(--destructive);
+  --color-danger-hover: var(--destructive-hover);
+  --color-warn: var(--warning);
+  --color-ok: var(--success);
+  --color-overlay: var(--overlay);
+}
+
+html, body, #app { height: 100%; }
+body {
+  margin: 0;
+  background: var(--canvas);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+}
+* { scrollbar-width: thin; scrollbar-color: var(--secondary-selected) transparent; }
+::selection { background: var(--primary-soft); }
+:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.tabular { font-variant-numeric: tabular-nums; }
+
+@keyframes pulse-soft { 0%, 100% { opacity: 1 } 50% { opacity: .55 } }
+.animate-pulse-soft { animation: pulse-soft 1.6s ease-in-out infinite; }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}
