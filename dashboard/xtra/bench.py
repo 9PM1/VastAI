@@ -94,7 +94,7 @@ async def run(store):
             "dph": vast.get("dph"), "images_per_dollar": round(images_per_hour / vast["dph"]) if vast.get("dph") else None,
             "attention": tune.get("attention"), "args": tune.get("args"),
             "host_score": h.get("score"), "host_warnings": h.get("warnings", []),
-            "instance_id": vast.get("id"),
+            "instance_id": vast.get("id"), "machine_id": vast.get("machine_id"), "dlperf": vast.get("dlperf"),
         }
         await asyncio.to_thread(store.put, "benchmarks", result)
         _publish(running=False, step="Done", last=result)

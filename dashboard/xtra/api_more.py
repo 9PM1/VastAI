@@ -7,6 +7,7 @@ from aiohttp import web
 from . import autostop, backup, bench, fixer, health, library, sources, system, updater
 from .api import _body, _dl, _store, ok
 from .events import bus
+from .util import log
 
 routes = web.RouteTableDef()
 
@@ -109,12 +110,32 @@ async def run_health(app, notify_warnings=False):
     finally:
         app["health_running"] = False
     bus.publish("health", {"running": False, "result": result})
+    await _remember_host(app["store"], result)
     if notify_warnings and result["warnings"]:
         from . import notify
         await notify.discord(app["store"].setting("discord_webhook"), f"⚠️ Host health: {result['score']}",
                              "\n".join(f"• {w}" for w in result["warnings"]) + "\n\nConsider destroying this instance and renting another.",
                              color=0xFD9903)
     return result
+
+
+async def _remember_host(store, result):
+    """Keep each machine's health verdict in the shared database, so `xtra rent` skips poor hosts
+    even when this one was rented from the Vast website."""
+    try:
+        vast = await system.vast_instance() or {}
+        if vast.get("machine_id"):
+            await asyncio.to_thread(store.put, "hosts", {
+                "id": str(vast["machine_id"]), "machine_id": vast["machine_id"], "gpu": result.get("gpu"),
+                "score": result["score"], "warnings": result["warnings"], "at": result.get("at"),
+                "dlperf": vast.get("dlperf"), "dph": vast.get("dph")})
+    except Exception as exc:
+        log.info("Could not record host health: %s", exc)
+
+
+@routes.get("/api/hosts")
+async def hosts_list(request):
+    return ok(_store(request).all("hosts"))
 
 
 @routes.get("/api/benchmark")

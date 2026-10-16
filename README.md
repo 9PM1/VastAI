@@ -57,13 +57,23 @@ reads on every start.
 talks to the dashboard over SSH, so no portal token is needed:
 
 ```bash
-python tools/xtra.py offers --gpu RTX_5090,RTX_4090 --max-price 0.9   # good hosts, best value first
-python tools/xtra.py rent --gpu RTX_4090 --bundles starter --keep-models
+python tools/xtra.py offers --for my_workflow.json                    # best value for this workflow
+python tools/xtra.py offers --rank speed --max-price 1.0                # fastest under $1/h
+python tools/xtra.py rent --for my_workflow.json --auto-swap --bundles starter
 python tools/xtra.py status            # GPU, ComfyUI, disk, host health
 python tools/xtra.py tunnel            # dashboard on localhost:17890, ComfyUI on localhost:17891
 python tools/xtra.py fix my_workflow.json
 python tools/xtra.py destroy 12345678
 ```
+
+`offers` and `rent` price hosts at what they really cost (GPU + your disk size + the host's
+download fee for your models) and rank them by images per dollar (`--rank speed` for the fastest
+within `--max-price`). Speed comes from your own benchmarks when you've run one on that GPU
+model, else from a built-in table. Hosts scoring well below others with the same GPU
+(power-limited, throttled) are hidden, and so are machines that failed the host check in the last
+30 days, whether you rented them with `xtra` or from the Vast website. `--for workflow.json` sets
+the VRAM and download size from the workflow (`xtra needs workflow.json` shows the breakdown), and
+`--auto-swap` replaces a host that fails the check automatically.
 
 `--keep-models` creates a Vast local volume (`comfy-xtra-models`) on the first rent and links it
 afterwards; local volumes are tied to one machine. `tools/claude-skill/` is the same tool packaged

@@ -147,6 +147,8 @@ s, nb = j("POST", "/api/bundles/from-workflow", json={"name": "from wf test", "m
 check("bundle from workflow", s == 200 and nb["bundle"]["id"], nb)
 if s == 200:
     j("DELETE", f"/api/bundles/{nb['bundle']['id']}")
+s, d = j("GET", "/api/hosts")
+check("host verdicts list", s == 200 and isinstance(d, list), d)
 s, d = j("GET", "/api/autostop")
 check("autostop status", s == 200 and "enabled" in d, d)
 s, d = j("GET", "/api/update")
