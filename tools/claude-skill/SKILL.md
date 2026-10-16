@@ -40,7 +40,10 @@ Renting spends the user's money. Follow this every time, even when the user says
    Models are re-downloaded on every new instance (about 20 GB for a MiniMax/Krea set, 60 GB+ for video
    stacks), so it's a recurring cost. The helper hides hosts over $10/TB; raise `--max-download-per-tb` only
    if the user asks.
-5. **If the user says stop, stop first:** kill the running `rent`, destroy (or stop, if it holds their data)
+5. **Upload and power count too.** Upload ($/TB) is what viewing/downloading outputs and backups cost; hosts
+   over $20/TB upload are hidden. POWER shows a host's power cap vs. a full card (most RTX 5090s run 450-520 W
+   of 575-600); speed estimates already include it. Mention both when recommending.
+6. **If the user says stop, stop first:** kill the running `rent`, destroy (or stop, if it holds their data)
    what was just rented, confirm with `status`, then explain.
 
 **What went wrong once (2026-10-16), so it doesn't again:** the user asked for "at least a 4090, 50 GB disk".
@@ -48,6 +51,19 @@ The best offer (RTX 4090, Bulgaria, $0.53/h) was taken a minute later, and `rent
 the next one: an RTX 5090 in Estonia charging **$40/TB** to download. It ranked "best value" only because the
 fee was spread over an assumed 4-hour session, and the $/TB was never shown. The user had to stop it. Cheaper,
 faster hosts at $1-4/TB were available. Hence rules 2-4 and the `--offer` flag.
+
+## Money facts measured on Vast (2026-10-16)
+
+- Stopped instances keep paying for storage (about $0.40-1.80/day for 80 GB), possibly at a higher rate than
+  running. Recreating costs one model download (~$0.10 at $2-3/TB) plus a few minutes, and bundles + the fixer
+  restore models automatically. For breaks longer than ~6-8 hours, destroying (after a backup) is cheaper than
+  stopping; for short breaks, stopping is.
+- Interruptible (bid) instances are 35-40% cheaper but can be paused when outbid: fine for batch jobs, not for
+  interactive sessions.
+- Setup time is set by the host's network: 40 GB took 333 s at 1 Gbps and 74 s at 6.6 Gbps (single files top
+  out near 2.2 Gbps). Disk can't be resized: size it from `fix`/`needs` minimum (or maximum) + room for outputs.
+- Some hosts look fine idle and halve their speed under load (driver "reliability" clock limit); the host
+  check's 30 s load test marks those "poor". Offer to replace a poor host.
 
 ## How to work
 
