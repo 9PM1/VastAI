@@ -102,8 +102,8 @@ class DownloadManager:
         category = config.normalize_category(spec.get("category"), default="")
         if not category:
             raise ValueError(f"Unknown category: {spec.get('category')!r}")
-        filename = spec.get("filename") or os.path.basename(spec["url"].split("?")[0]) or "model.safetensors"
-        target = model_path(category, filename)
+        filename = (spec.get("filename") or os.path.basename(spec["url"].split("?")[0]) or "model.safetensors").replace("\\", "/")
+        target = model_path(category, filename, subdirs=True)  # workflows may expect a sub-folder
         for t in self.tasks.values():
             if t["target"] == str(target) and t["status"] in ACTIVE:
                 return t
@@ -195,6 +195,7 @@ class DownloadManager:
                 await self._verify(task, part)
                 if task["status"] == "cancelled":
                     raise Cancelled()
+                os.makedirs(os.path.dirname(task["target"]), exist_ok=True)
                 os.replace(part, task["target"])
                 shutil.rmtree(staging, ignore_errors=True)
                 size = os.path.getsize(task["target"])

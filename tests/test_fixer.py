@@ -145,6 +145,122 @@ class CivitaiFind(unittest.TestCase):
         self.assertEqual(r["confidence"], "possible")  # still offered, to try by hand
 
 
+from xtra import util, workflows  # noqa: E402
+
+NOTE = """## Model Links
+
+**Video VAE**
+- [minimax_h3_video_vae_int8_convrot.safetensors](https://huggingface.co/Kijai/MiniMax-H3-experimental/resolve/main/minimax_h3_video_vae_int8_convrot.safetensors?download=true)
+
+**vae_approx (TAE)**
+- [taeh3.safetensors](https://huggingface.co/Kijai/MiniMax-H3-TAE/resolve/main/vae_approx/taeh3.safetensors?download=true)
+
+### Frame Interpolation
+- [frame interpolation models](https://huggingface.co/Comfy-Org/frame_interpolation/tree/main/frame_interpolation) (optional)
+
+## Requirements
+- [ComfyUI-DaSiWa-Nodes](https://github.com/darksidewalker/ComfyUI-DaSiWa-Nodes)
+"""
+SG = "e0940f57-80b2-480e-8a38-36968dc1763d"
+
+
+def stress_workflow():
+    """The shape of DaSiWa's MiniMax H3 workflow: a settings subgraph overriding inner loaders,
+    bypassed optional loaders, and the download links in a note."""
+    return {
+        "nodes": [
+            {"id": 1, "type": "MarkdownNote", "widgets_values": [NOTE]},
+            {"id": 2, "type": SG, "mode": 0, "widgets_values": ["euler", "MiniMaxH3/dasiwa_turbo_int8.safetensors", "MiniMaxH3/minimax_h3_video_vae_int8_convrot.safetensors"]},
+            {"id": 3, "type": "ModelPreviewOverrideKJ", "widgets_values": [512, "taeh3.safetensors"]},
+            {"id": 4, "type": "FrameInterpolationModelLoader", "mode": 4, "widgets_values": ["rife_v4.26.safetensors"]},
+        ],
+        "definitions": {"subgraphs": [{
+            "id": SG, "name": "Checkpoint settings",
+            "inputs": [{"name": "sampler_name", "type": "COMBO", "linkIds": [10]},
+                       {"name": "unet_name", "type": "COMBO", "linkIds": [11]},
+                       {"name": "vae_name", "type": "COMBO", "linkIds": [12]},
+                       {"name": "model", "type": "MODEL", "linkIds": [13]}],
+            "links": [{"id": 11, "origin_id": -10, "target_id": 20, "target_slot": 0},
+                      {"id": 12, "origin_id": -10, "target_id": 21, "target_slot": 0}],
+            "nodes": [
+                {"id": 20, "type": "UNETLoader", "widgets_values": ["MiniMaxH3/minimax_h3_fl2va_pruned_int8_convrot.safetensors", "default"],
+                 "properties": {"models": [{"name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors", "directory": "diffusion_models",
+                                            "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors"}]}},
+                {"id": 21, "type": "VAELoader", "widgets_values": ["MiniMaxH3/minimax_h3_video_vae_fp16.safetensors"]},
+            ]}]},
+    }
+
+
+class WorkflowHints(unittest.TestCase):
+    def test_subgraph_values_override_inner_loaders(self):
+        refs = {r["name"]: r for r in workflows.extract(stress_workflow())}
+        turbo = refs["MiniMaxH3/dasiwa_turbo_int8.safetensors"]
+        self.assertEqual((turbo["category"], turbo["active"]), ("diffusion_models", True))
+        self.assertTrue(refs["MiniMaxH3/minimax_h3_video_vae_int8_convrot.safetensors"]["active"])
+        self.assertNotIn("MiniMaxH3/minimax_h3_video_vae_fp16.safetensors", refs)  # replaced by the subgraph's value
+        fl2va = next(r for r in refs.values() if "fl2va" in r["name"])
+        self.assertFalse(fl2va["active"])  # only listed in the template's model links
+
+    def test_switched_off_nodes_are_optional(self):
+        refs = {r["name"]: r for r in workflows.extract(stress_workflow())}
+        self.assertFalse(refs["rife_v4.26.safetensors"]["active"])
+        self.assertEqual(refs["rife_v4.26.safetensors"]["category"], "frame_interpolation")
+        self.assertEqual(refs["taeh3.safetensors"]["category"], "vae_approx")
+
+    def test_note_links_and_headings(self):
+        h = workflows.hints(stress_workflow())
+        files = {f["filename"]: f for f in h["files"]}
+        self.assertEqual(files["taeh3.safetensors"]["category"], "vae_approx")
+        self.assertEqual(files["minimax_h3_video_vae_int8_convrot.safetensors"]["category"], "vae")
+        self.assertTrue(files["taeh3.safetensors"]["url"].endswith("/vae_approx/taeh3.safetensors"))  # no ?download=true
+        self.assertEqual(h["folders"], [{"repo": "Comfy-Org/frame_interpolation", "folder": "frame_interpolation",
+                                         "revision": "main", "category": "frame_interpolation"}])
+        self.assertEqual(h["github"][0]["url"], "https://github.com/darksidewalker/ComfyUI-DaSiWa-Nodes")
+
+    def test_plan_uses_notes_keeps_subfolders_and_skips_optional(self):
+        saved = (fixer.manager_models, fixer.hf_index, fixer.civitai_find, fixer._repo_files, fixer.missing_nodes, fixer.openmodeldb_index)
+        fixer.manager_models = lambda: {}
+        fixer.hf_index = lambda wait=False: {}
+        fixer.civitai_find = lambda *a, **k: None
+        fixer.openmodeldb_index = lambda: {}
+        fixer.missing_nodes = lambda wf, reported=None, hints=None: []
+        fixer._repo_files = lambda repo, revision="main", folder="", token="": (
+            [{"path": "frame_interpolation/rife_v4.26.safetensors", "size": 21_000_000,
+              "url": "https://huggingface.co/Comfy-Org/frame_interpolation/resolve/main/frame_interpolation/rife_v4.26.safetensors"}]
+            if repo == "Comfy-Org/frame_interpolation" else [])
+        try:
+            plan = fixer.plan(stress_workflow(), [], {})
+        finally:
+            (fixer.manager_models, fixer.hf_index, fixer.civitai_find, fixer._repo_files, fixer.missing_nodes, fixer.openmodeldb_index) = saved
+        by = {m["filename"]: m for m in plan["models"]}
+        vae = by["minimax_h3_video_vae_int8_convrot.safetensors"]
+        self.assertEqual(vae["origin"], "workflow-note")
+        self.assertEqual(vae["fix"]["candidate"]["filename"], "MiniMaxH3/minimax_h3_video_vae_int8_convrot.safetensors")
+        rife = by["rife_v4.26.safetensors"]
+        self.assertTrue(rife["optional"])
+        self.assertEqual(rife["origin"], "workflow-note:Comfy-Org/frame_interpolation")
+        self.assertEqual(plan["summary"]["models_optional"], 2)  # rife + the overridden fl2va
+        self.assertEqual(plan["summary"]["unresolved"], ["dasiwa_turbo_int8.safetensors"])
+        self.assertEqual(plan["summary"]["download_bytes"], 0 + (vae["fix"]["size"] or 0) + (by["taeh3.safetensors"]["fix"]["size"] or 0))
+
+    def test_pack_from_notes(self):
+        hints = workflows.hints(stress_workflow())
+        p = fixer._pack_from_notes("DaSiWa_Watermark", hints, {})
+        self.assertEqual(p["git_url"], "https://github.com/darksidewalker/ComfyUI-DaSiWa-Nodes")
+        self.assertIsNone(fixer._pack_from_notes("SomethingElse", {"github": []}, {}))
+
+
+class ModelPaths(unittest.TestCase):
+    def test_subfolders_only_when_allowed_and_contained(self):
+        p = util.model_path("vae", "MiniMaxH3/x.safetensors", subdirs=True)
+        self.assertEqual((p.parent.name, p.name), ("MiniMaxH3", "x.safetensors"))
+        for bad in ("../x.safetensors", "a/../../x.safetensors", "/etc/passwd", "a/b/c/d/e.safetensors"):
+            with self.assertRaises(ValueError):
+                util.model_path("vae", bad, subdirs=True)
+        with self.assertRaises(ValueError):
+            util.model_path("vae", "MiniMaxH3/x.safetensors")
+
+
 class FileTypeGuard(unittest.TestCase):
     def write(self, keys):
         header = json.dumps({k: {"dtype": "F16", "shape": [1], "data_offsets": [0, 2]} for k in keys}).encode()
