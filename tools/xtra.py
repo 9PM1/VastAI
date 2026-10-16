@@ -286,7 +286,7 @@ def cmd_fix(a):
     print(f"{s['models_missing']} missing model(s) ({s['models_fixable']} fixable), {s['nodes_missing']} missing node type(s)")
     for m in plan["models"]:
         if m["status"] != "installed":
-            src = m.get("origin") or "NOT FOUND"
+            src = (m.get("origin") or "NOT FOUND") + (" (gated: accept licence + HF token)" if ((m.get("fix") or {}).get("candidate") or {}).get("gated") else "")
             print(f"  model  {m['filename']:<48} {m['category'] or '?':<16} {src}")
     for n in plan["nodes"]:
         print(f"  node   {n['type']:<48} {(n['pack'] or {}).get('title') or 'no pack found'}")

@@ -6,6 +6,7 @@ Needs internet (Civitai and Hugging Face). Exits non-zero when a check fails.
 import io
 import json
 import os
+import re
 import sys
 import time
 import zipfile
@@ -92,7 +93,7 @@ while time.time() < deadline:
     time.sleep(2)
 for t in tasks:
     print("   task:", t["filename"], t["status"], t["error"] or "", t["size"])
-civ_blocked = not CIVITAI_TOKEN and any(t["filename"] == civ["filename"] and "Access denied" in (t["error"] or "") for t in tasks)
+civ_blocked = not CIVITAI_TOKEN and any(t["filename"] == civ["filename"] and re.search("refused|Access denied", t["error"] or "") for t in tasks)
 if civ_blocked:
     print("SKIP Civitai download checks: anonymous download refused (set CIVITAI_TOKEN)")
 check("downloads finished", all(t["status"] == "done" or (civ_blocked and t["filename"] == civ["filename"]) for t in tasks),

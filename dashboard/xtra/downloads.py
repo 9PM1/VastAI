@@ -42,6 +42,26 @@ def fmt_eta(seconds):
     return f"{h}h {m}m" if h else f"{m}m {s}s" if m else f"{s}s"
 
 
+
+def denied_message(url):
+    """Plain explanation when a host refuses a download."""
+    m = re.match(r"https://huggingface\.co/([^/]+/[^/]+)/", url or "")
+    if m:
+        return (f"Hugging Face refused the download: {m.group(1)} is gated. Accept its licence at "
+                f"https://huggingface.co/{m.group(1)} and add a Hugging Face token in Settings.")
+    if "civitai.com" in (url or ""):
+        return "Civitai refused the download. Add or check your Civitai API key in Settings."
+    return ("Access denied by the server. Add or check your API token in Settings; "
+            "some models also need their licence accepted on the website.")
+
+
+def _aria2_reason(detail):
+    """aria2's error line without its log noise."""
+    detail = re.sub(r"\[[\w.]+:\d+\]\s*", "", detail)
+    detail = re.sub(r"\s*\|?\s*(aria2 will resume[^|]*|If there are any errors[^|]*)", "", detail)
+    return detail.strip(" |-:>") or "Download failed"
+
+
 class Cancelled(Exception):
     pass
 
@@ -229,7 +249,7 @@ class DownloadManager:
                         cur = urllib.parse.urljoin(cur, r.headers["Location"])
                         continue
                     if r.status in (401, 403):
-                        raise PermissionError(f"Access denied (HTTP {r.status}). Add or check your API token in Settings; some models also need their licence accepted on the website.")
+                        raise PermissionError(denied_message(url))
                     r.raise_for_status()
                     break
         same = urllib.parse.urlparse(cur).netloc == origin
@@ -281,9 +301,9 @@ class DownloadManager:
             raise Cancelled()
         if rc != 0:
             detail = " | ".join(tail[-3:]) or f"aria2c exited with code {rc}"
-            if "401" in detail or "403" in detail:
-                raise PermissionError(f"Access denied ({detail}). Add or check your API token in Settings; some models also need their licence accepted on the website.")
-            raise RuntimeError(detail)
+            if re.search(r"status=40[13]|errorCode=24|Authorization failed", detail):
+                raise PermissionError(denied_message(task["url"]))
+            raise RuntimeError(_aria2_reason(detail))
 
     async def _http(self, task, part, headers, url):
         start = part.stat().st_size if part.exists() else 0
@@ -292,7 +312,7 @@ class DownloadManager:
         async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": "Comfy-Xtra/2"}) as s:
             async with s.get(url, headers=req_headers) as r:
                 if r.status in (401, 403):
-                    raise PermissionError(f"Access denied (HTTP {r.status}). Add or check your API token in Settings.")
+                    raise PermissionError(denied_message(url))
                 r.raise_for_status()
                 if start and r.status != 206:
                     start = 0  # server ignored Range: start over

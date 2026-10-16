@@ -180,21 +180,22 @@ def find_model(filename, category, settings, library, embedded_url=""):
                 return {"origin": "workflow", "confidence": "exact", "candidate": cand}
         except Exception as exc:
             log.info("Embedded URL for %s did not resolve: %s", filename, exc)
+    found = []
     m = manager_models().get(key)
     if m:
         cat = MANAGER_CATEGORY.get((m.get("type") or "").lower()) or category or sources.guess_category(filename)
-        return {"origin": "comfyui-manager", "confidence": "exact", "candidate": {
+        found.append({"origin": "comfyui-manager", "confidence": "exact", "candidate": {
             "source": "hf" if "huggingface.co" in m["url"] else "url", "name": m.get("name") or filename,
             "filename": m["filename"], "url": m["url"], "category": category or cat,
-            "size": _size_to_bytes(m.get("size")), "sha256": "", "preview": "", "page_url": m.get("reference") or ""}}
+            "size": _size_to_bytes(m.get("size")), "sha256": "", "preview": "", "page_url": m.get("reference") or ""}})
     try:
         hits = hf_index(wait=False).get(key) or []
     except Exception as exc:
         log.warning("HF index unavailable: %s", exc)
         hits = []
-    if hits:
-        # Prefer the official Comfy-Org repackage, then the shortest path.
-        hit = sorted(hits, key=lambda h: (not h["repo"].startswith("Comfy-Org/"), len(h["path"])))[0]
+    # Prefer the official Comfy-Org repackage, then the shortest path.
+    hits = sorted(hits, key=lambda h: (not h["repo"].startswith("Comfy-Org/"), len(h["path"])))
+    for hit in hits[:3]:
         try:
             cand = sources.hf_file(hit["repo"], hit["path"], token=settings.get("hf_token"))
         except Exception:
@@ -202,13 +203,35 @@ def find_model(filename, category, settings, library, embedded_url=""):
                     "url": sources.hf_download_url(hit["repo"], hit["path"]), "preview": "",
                     "page_url": f"https://huggingface.co/{hit['repo']}"}
         cand["category"] = category or cand.get("category")
-        return {"origin": f"huggingface:{hit['repo']}", "confidence": "exact", "candidate": cand,
-                "alternatives": [h["repo"] for h in hits[1:5]]}
+        found.append({"origin": f"huggingface:{hit['repo']}", "confidence": "exact", "candidate": cand,
+                      "alternatives": [h["repo"] for h in hits if h is not hit][:4]})
+    if found:
+        # Gated repos (licence not accepted, or no token) fail at download time, so pick one that opens.
+        for f in found:
+            if f["candidate"]["source"] != "hf" or _hf_accessible(f["candidate"]["url"], settings.get("hf_token")):
+                return f
+        f = found[0]
+        f["candidate"]["gated"] = True
+        f["note"] = ("Gated on Hugging Face: accept the licence on the model page"
+                     + ("" if settings.get("hf_token") else " and add a Hugging Face token in Settings"))
+        return f
     cand = civitai_exact(filename, settings)
     if cand:
         cand["category"] = category or cand["category"]
         return {"origin": "civitai", "confidence": "exact", "candidate": cand}
     return None
+
+
+def _hf_accessible(url, token=""):
+    """True unless Hugging Face refuses the file (gated repo without access). Cached for 10 minutes."""
+    def check():
+        try:
+            r = requests.head(url, headers={"Authorization": f"Bearer {token}"} if token else {},
+                              allow_redirects=False, timeout=10)
+            return r.status_code not in (401, 403)
+        except requests.RequestException:
+            return True  # can't tell; let the download try
+    return _cached(f"hf_access:{url}:{bool(token)}", 600, check)
 
 
 def _size_to_bytes(text):
@@ -244,14 +267,15 @@ def manager_mappings():
 
 
 def _pack_info(key, packs):
-    """Manager list entry for a pack key (CNR id or git URL)."""
+    """Manager list entry for a pack key (list key, CNR id or git URL). `key` in the result is the
+    list key, which install_packs takes; `id` stays the Manager's own id for its install API."""
     if key in packs:
-        return {**packs[key], "id": packs[key].get("id") or key}
+        return {**packs[key], "id": packs[key].get("id") or key, "key": key}
     norm = key.rstrip("/").removesuffix(".git").lower()
     for pid, p in packs.items():
         repo = (p.get("repository") or (p.get("files") or [""])[0] or "").rstrip("/").removesuffix(".git").lower()
-        if repo and repo == norm:
-            return {**p, "id": p.get("id") or pid}
+        if (repo and repo == norm) or p.get("id") == key:
+            return {**p, "id": p.get("id") or pid, "key": pid}
     return None
 
 
@@ -301,7 +325,7 @@ def missing_nodes(workflow, reported=None):
         if not keys:
             keys = [k for pat, k in patterns if re.match(pat, t)]
         infos = [i for i in (_pack_info(k, packs) for k in dict.fromkeys(keys)) if i]
-        infos.sort(key=lambda p: (p["id"] != cnr, -(p.get("stars") or 0)))
+        infos.sort(key=lambda p: (cnr not in (p["id"], p["key"]), -(p.get("stars") or 0)))
         pack = infos[0] if infos else None
         out.append({"type": t, "pack": _pack_summary(pack), "alternatives": [_pack_summary(p) for p in infos[1:4]]})
     return out
@@ -310,7 +334,7 @@ def missing_nodes(workflow, reported=None):
 def _pack_summary(p):
     if not p:
         return None
-    return {"id": p["id"], "title": p.get("title") or p["id"], "repository": p.get("repository") or (p.get("files") or [""])[0],
+    return {"id": p["key"], "title": p.get("title") or p["id"], "repository": p.get("repository") or (p.get("files") or [""])[0],
             "stars": p.get("stars") or 0, "state": p.get("state") or "not-installed", "version": p.get("version") or "unknown",
             "description": (p.get("description") or "")[:200]}
 
@@ -327,7 +351,7 @@ def install_packs(pack_ids):
         if p.get("state") in ("enabled", "installed"):
             results[pid] = "already installed"
             continue
-        body = {**p, "selected_version": "latest" if p.get("version", "unknown") != "unknown" else "unknown",
+        body = {**{k: v for k, v in p.items() if k != "key"}, "selected_version": "latest" if p.get("version", "unknown") != "unknown" else "unknown",
                 "ui_id": pid, "channel": "default", "mode": "cache", "skip_post_install": False}
         r = requests.post(config.COMFY_URL + "/manager/queue/install", json=body, timeout=30)
         results[pid] = "queued" if r.ok else f"refused ({r.status_code}): {r.text[:160]}"
@@ -361,13 +385,15 @@ def plan(workflow, library, settings, reported_missing_nodes=None):
                              fix={"kind": "download", "candidate": {k: v for k, v in cand.items() if k not in ("versions",)},
                                   "size": cand.get("size") or 0})
                 entry["category"] = entry["category"] or cand.get("category")
+                entry["note"] = found.get("note")
         out_models.append(entry)
     nodes_error = ""
     try:
         nodes = missing_nodes(workflow, reported_missing_nodes)
     except Exception as exc:
         nodes, nodes_error = [], str(exc)
-    need = sum(e["fix"]["size"] for e in out_models if e["fix"] and e["fix"]["kind"] == "download")
+    auto = [e for e in out_models if e["fix"] and not (e["fix"].get("candidate") or {}).get("gated")]
+    need = sum(e["fix"]["size"] for e in auto if e["fix"]["kind"] == "download")
     free = shutil.disk_usage(config.WORKSPACE).free if config.WORKSPACE.exists() else None
     unresolved = [e["filename"] for e in out_models if e["status"] != "installed" and not e["fix"]]
     return {
@@ -375,7 +401,7 @@ def plan(workflow, library, settings, reported_missing_nodes=None):
         "nodes": nodes,
         "summary": {
             "models_missing": sum(1 for e in out_models if e["status"] != "installed"),
-            "models_fixable": sum(1 for e in out_models if e["fix"]),
+            "models_fixable": len(auto),  # gated files need the user to accept a licence first
             "nodes_missing": len(nodes),
             "nodes_fixable": sum(1 for n in nodes if n["pack"] and n["pack"]["state"] not in ("enabled", "installed")),
             "download_bytes": need,

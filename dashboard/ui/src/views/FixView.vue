@@ -76,7 +76,8 @@ onMounted(() => {
 
 const missingModels = computed(() => (plan.value?.models || []).filter((m) => m.status !== 'installed'))
 const okModels = computed(() => (plan.value?.models || []).filter((m) => m.status === 'installed'))
-const fixableModels = computed(() => missingModels.value.filter((m) => m.fix))
+// Gated Hugging Face files need a licence accepted first, so Fix all leaves them out.
+const fixableModels = computed(() => missingModels.value.filter((m) => m.fix && !m.fix.candidate?.gated))
 const unresolved = computed(() => missingModels.value.filter((m) => !m.fix))
 const nodes = computed(() => plan.value?.nodes || [])
 const installablePacks = computed(() => [...new Set(nodes.value.filter((n) => n.pack && !['enabled', 'installed'].includes(n.pack.state)).map((n) => n.pack.id))])
@@ -258,6 +259,10 @@ const addOpen = ref(false)
                 <template v-if="m.fix?.kind === 'download'"> · {{ ORIGIN(m.origin) }}<template v-if="m.fix.size"> · {{ bytes(m.fix.size) }}</template></template>
                 <template v-if="m.fix?.kind === 'move'"> · in {{ m.fix.from }}</template>
               </p>
+              <p v-if="m.fix?.candidate?.gated && !taskFor(m)" class="mt-1 text-[11px] text-warn">
+                {{ m.note }}. <a :href="m.fix.candidate.page_url" target="_blank" rel="noopener" class="underline hover:text-fg">Open model page</a>
+              </p>
+              <p v-if="taskFor(m)?.status === 'failed'" class="mt-1 text-[11px] text-danger-hover">{{ taskFor(m).error }}</p>
               <div v-if="taskFor(m) && !['done'].includes(taskFor(m).status)" class="mt-1.5"><Bar :value="pct(taskFor(m).done, taskFor(m).size)" :indeterminate="!taskFor(m).size" :label="`${m.filename} progress`" /></div>
             </div>
             <template v-if="taskFor(m)">
