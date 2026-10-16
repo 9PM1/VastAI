@@ -6,7 +6,7 @@ added at vast.ai/account). Talks to the Comfy-Xtra dashboard on the instance ove
 portal token is needed.
 
   xtra offers [--gpu RTX_4090,RTX_5090] [--max-price 0.8] [--min-vram 16] [--rank value|speed] [--for WORKFLOW]
-  xtra rent   [same filters] [--disk 100] [--bundles a,b] [--auto-swap] [--keep-models] [--yes] [--dry-run]
+  xtra rent   [same filters] [--offer ID] [--disk 100] [--bundles a,b] [--auto-swap] [--keep-models] [--yes] [--dry-run]
   xtra needs WORKFLOW       VRAM and download size a workflow needs
   xtra status [ID]          instances + dashboard / GPU / host health
   xtra hosts [--forget ID|all]   machines skipped because they failed the host check
@@ -586,6 +586,12 @@ def cmd_rent(a):
     shared = shared_data(a.refresh)
     bad = bad_hosts(shared)
     offers, hidden = search_offers(a, machine, bad, shared)
+    if a.offer:
+        # Exactly the offer the user approved, or nothing: never fall through to one they haven't seen.
+        offers = [o for o in offers if o["id"] == a.offer]
+        if not offers:
+            die(f"offer {a.offer} is no longer available (rented by someone else, or now outside your filters). "
+                "Nothing was rented; run `xtra offers` again and pick another.")
     vol_offers = {}
     if a.keep_models and not machine:
         # A new local volume must be created on the same machine as the instance.
@@ -596,7 +602,7 @@ def cmd_rent(a):
             (", or the volume's machine is busy" if machine else ", or drop --keep-models: few machines offer volumes" if a.keep_models else "") + ")"
             + (f". {describe_hidden(hidden, a)}" if describe_hidden(hidden, a) else ""))
     env_args = " ".join(f"-e {k}={v}" for k, v in env.items())
-    tries = 1 + (a.max_swaps if a.auto_swap else 0)
+    tries = 1 + (a.max_swaps if a.auto_swap and not a.offer else 0)  # --offer: no swaps to unseen hosts
     spent = 0.0
     for attempt in range(tries):
         offers = [o for o in offers if str(o["machine_id"]) not in bad]
@@ -862,6 +868,7 @@ def main():
     p = sub.add_parser("rent", help="rent the best matching host with your template")
     add_offer_args(p)
     p.add_argument("--bundles", help="bundles to auto-install, comma separated")
+    p.add_argument("--offer", type=int, help="rent exactly this offer id (from `xtra offers`), or nothing if it's gone")
     p.add_argument("--auto-swap", action="store_true", help="if the host check fails, destroy it and rent the next best host")
     p.add_argument("--max-swaps", type=int, default=2)
     p.add_argument("--no-bench", action="store_true", help="don't benchmark GPU models you haven't measured yet")

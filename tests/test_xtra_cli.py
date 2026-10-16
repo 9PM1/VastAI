@@ -136,7 +136,7 @@ class BadHostMemory(unittest.TestCase):
 class AutoSwap(unittest.TestCase):
     """rent --auto-swap with Vast faked: the first host fails the check, the second passes."""
 
-    def run_rent(self, auto_swap, healths, wait_ready=None):
+    def run_rent(self, auto_swap, healths, wait_ready=None, extra=()):
         calls, saved = [], {}
         offers = [dict(offer(i, "RTX 4090", 96, 0.5 + i / 100, 100 + i), _hourly=0.5, _fee=0.1, _cost_h=0.53, _ips=8900,
                        _ipd=16000, _perf=1.0, _measured=True, inet_down=1000, disk_bw=3000, geolocation="X") for i in (1, 2, 3)]
@@ -155,7 +155,7 @@ class AutoSwap(unittest.TestCase):
             setattr(xtra, k, v)
         try:
             xtra.save_json(xtra.BAD_HOSTS_FILE, {})
-            args = ["rent", "--yes", "--gpu", "RTX_4090"] + (["--auto-swap"] if auto_swap else [])
+            args = ["rent", "--yes", "--gpu", "RTX_4090"] + (["--auto-swap"] if auto_swap else []) + list(extra)
             import sys
             argv, sys.argv = sys.argv, ["xtra"] + args
             try:
@@ -182,6 +182,18 @@ class AutoSwap(unittest.TestCase):
         calls = self.run_rent(True, [{"score": "good", "warnings": []}], wait_ready=stuck_then_ok)
         self.assertEqual([c[:3] for c in calls], [("create", "instance", "1"), ("destroy", "instance", "901"), ("create", "instance", "2")])
         self.assertIn("101", xtra.bad_hosts())
+
+    def test_offer_rents_exactly_that_offer(self):
+        calls = self.run_rent(False, [{"score": "good", "warnings": []}], extra=["--offer", "2"])
+        self.assertEqual([c[:3] for c in calls], [("create", "instance", "2")])
+
+    def test_gone_offer_rents_nothing(self):
+        with self.assertRaises(SystemExit):
+            self.run_rent(True, [], extra=["--offer", "999"])
+
+    def test_offer_never_swaps_to_an_unseen_host(self):
+        calls = self.run_rent(True, [{"score": "poor", "warnings": ["x4 PCIe"]}], extra=["--offer", "1"])
+        self.assertEqual([c[0] for c in calls], ["create"])
 
     def test_without_auto_swap_keeps_it(self):
         calls = self.run_rent(False, [{"score": "poor", "warnings": ["x4 PCIe"]}])
