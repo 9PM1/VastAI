@@ -9,6 +9,7 @@ their partial data and resume on retry.
 """
 import asyncio
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -356,6 +357,12 @@ class DownloadManager:
             if digest != task["sha256"]:
                 part.unlink(missing_ok=True)
                 raise RuntimeError(f"Checksum mismatch (got {digest[:12]}…, expected {task['sha256'][:12]}…)")
+        kind = safetensors_kind(part)
+        if kind == "vae" and task["category"] not in ("vae", "vae_approx"):
+            # Generic names (diffusion_pytorch_model.safetensors) are shared by VAEs, UNets and ControlNets.
+            part.unlink(missing_ok=True)
+            raise RuntimeError(f"This file is a VAE, not a {task['category'].rstrip('s')} model, so it was not installed. "
+                               "Pick the right model in the Fixer or paste its link.")
 
     async def _notify_done(self, task):
         if not self.store.setting("notify_downloads"):
@@ -364,6 +371,23 @@ class DownloadManager:
         await notify.discord(self.store.setting("discord_webhook"), title,
                              f"**{task['name']}**\n`{task['category']}/{task['filename']}` ({human_size(task['size'])})",
                              thumbnail=task["preview"] or None)
+
+
+def safetensors_kind(path):
+    """'vae' when a .safetensors file holds only a VAE (encoder/decoder weights), else None.
+    Reads just the header, so it's instant even for large files."""
+    try:
+        with open(path, "rb") as f:
+            n = int.from_bytes(f.read(8), "little")
+            if not 0 < n < 100 * 2**20:
+                return None
+            keys = [k for k in json.loads(f.read(n)) if k != "__metadata__"]
+    except (OSError, ValueError):
+        return None
+    vae_prefixes = ("encoder.", "decoder.", "quant_conv.", "post_quant_conv.", "first_stage_model.")
+    if keys and all(k.startswith(vae_prefixes) for k in keys):
+        return "vae"
+    return None
 
 
 def _sha256(path):

@@ -13,6 +13,7 @@ installed through ComfyUI-Manager's queue (registered packs only).
 
 Network lookups are blocking; call these functions via asyncio.to_thread.
 """
+import difflib
 import json
 import os
 import re
@@ -59,7 +60,8 @@ def _comfy(path, timeout=20):
 
 # ---- sources of model files ----------------------------------------------------------------
 def manager_models():
-    """{basename_lower: entry} from ComfyUI-Manager's model list (empty if Manager isn't there)."""
+    """{basename_lower: [entries]} from ComfyUI-Manager's model list (empty if Manager isn't there).
+    A list, because names repeat: 20 different models are called diffusion_pytorch_model.safetensors."""
     def load():
         try:
             data = _comfy("/externalmodel/getlist?mode=cache")
@@ -70,7 +72,7 @@ def manager_models():
         for m in data.get("models", []):
             fn = (m.get("filename") or "").strip()
             if fn and m.get("url"):
-                out[fn.lower()] = m
+                out.setdefault(fn.lower(), []).append(m)
         return out
     return _cached("manager_models", 3600, load)
 
@@ -146,33 +148,131 @@ def _safe(fn):
         log.warning("Background task failed: %s", exc)
 
 
-def civitai_exact(filename, settings):
-    """Search Civitai for a version whose file has exactly this name."""
-    stem = os.path.splitext(filename)[0]
-    queries = [stem, re.sub(r"[_\-.]+", " ", stem)]
+# Civitai model types to search for each ComfyUI folder.
+CATEGORY_TO_CIVITAI = {
+    "loras": ["LORA", "LoCon", "DoRA"], "checkpoints": ["Checkpoint"], "diffusion_models": ["Checkpoint"],
+    "unet": ["Checkpoint"], "embeddings": ["TextualInversion"], "vae": ["VAE"], "controlnet": ["Controlnet"],
+    "upscale_models": ["Upscaler"],
+}
+# Words in file names that say which base model, version or training run a file is for, not what it is.
+FILENAME_NOISE = {
+    "lora", "lycoris", "locon", "loha", "dora", "lokr", "v", "ver", "version", "epoch", "step", "steps", "final",
+    "fp16", "fp8", "bf16", "fp32", "safetensors", "model", "sd", "sd15", "sd1", "sdxl", "xl", "ixl", "il", "ill",
+    "illu", "illustrious", "pony", "ponyxl", "pdxl", "noob", "noobai", "nai", "anima", "flux", "flux1", "dev",
+    "schnell", "krea", "krea2", "qwen", "qwen21", "wan", "wan21", "wan22", "hunyuan", "minimax", "minimaxh3", "h3",
+    "zimage", "turbo", "base", "base1", "r64", "r32", "r16", "rank", "k2", "the", "and", "for", "of", "in", "a", "by",
+    "style", "raw", "dim", "alpha", "e", "ep", "mix",
+}
+
+
+def _norm_filename(name):
+    return re.sub(r"[^a-z0-9]", "", os.path.splitext(os.path.basename(name or ""))[0].lower())
+
+
+def filename_words(stem):
+    """The words that describe a model in a file name: 'RealisticSnapshotKrea2V2' -> ['Realistic', 'Snapshot']."""
+    s = re.sub(r"([a-z])([A-Z])", r"\1 \2", stem)
+    s = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", s)
+    s = re.sub(r"([A-Za-z])(\d)", r"\1 \2", s)
+    s = re.sub(r"(\d)([A-Za-z])", r"\1 \2", s)
+    return [w for w in re.split(r"[^A-Za-z0-9]+", s)
+            if len(w) > 1 and w.lower() not in FILENAME_NOISE and not w.isdigit() and not re.fullmatch(r"v\d+", w.lower())]
+
+
+def _suggestion_from_candidate(c):
+    return {"source": c.get("source"), "name": c.get("name"), "base_model": c.get("base_model") or "",
+            "filename": c.get("filename"), "size": c.get("size") or 0, "preview": c.get("preview") or "",
+            "page_url": c.get("page_url") or "", "url": c.get("url")}
+
+
+def _civitai_suggestion(m, show_nsfw, v=None, f=None):
+    v = v or (m.get("modelVersions") or [{}])[0]
+    files = v.get("files") or []
+    f = f or next((x for x in files if x.get("primary")), files[0] if files else {})
+    preview, mature = sources._pick_preview(v.get("images"), show_nsfw)
+    return {"source": "civitai", "model_id": m.get("id"), "version_id": v.get("id"), "file_id": f.get("id"), "name": m.get("name"),
+            "version_name": v.get("name"), "base_model": v.get("baseModel") or "", "filename": f.get("name") or "",
+            "size": int(float(f.get("sizeKB") or 0) * 1024), "preview": preview, "preview_mature": mature,
+            "downloads": (m.get("stats") or {}).get("downloadCount", 0),
+            "page_url": f"https://civitai.com/models/{m.get('id')}?modelVersionId={v.get('id')}"}
+
+
+def civitai_find(filename, category, settings):
+    """Find a missing file on Civitai.
+
+    Civitai's search matches model names, not file names, and file names add base-model and
+    version noise ('RealisticSnapshotKrea2V2' is the model "Realistic Snapshot"). So search with
+    the file's own words, then compare every file of every version found. On real Civitai files
+    this finds 90% of 154 real files exactly, against ~55% for searching the raw file name.
+    Returns {"confidence": "exact"|"likely"|"possible", "candidate": ..., "possible": [...]} or None.
+    """
     token = settings.get("civitai_token")
-    for q in dict.fromkeys(queries):
+    show_nsfw = bool(settings.get("show_nsfw"))
+    stem = os.path.splitext(os.path.basename(filename))[0]
+    want = _norm_filename(filename)
+    words = filename_words(stem)
+    long_words = sorted({w for w in words if len(w) >= 4}, key=len, reverse=True)
+    queries = [stem, re.sub(r"[_\-.]+", " ", stem), " ".join(words)]
+    if len(long_words) >= 2:
+        queries.append(" ".join(long_words[:2]))
+    queries += long_words[:2]
+    params = {"limit": 100, "nsfw": "true"}
+    if CATEGORY_TO_CIVITAI.get(category):
+        params["types"] = CATEGORY_TO_CIVITAI[category]
+    likely, models_seen = None, {}
+    for q in dict.fromkeys(q.strip() for q in queries if q.strip()):
         try:
-            data = sources._get_json(f"{sources.CIVITAI}/models", sources._civitai_headers(token),
-                                     {"query": q[:80], "limit": 20, "nsfw": "true"})
+            data = sources._get_json(f"{sources.CIVITAI}/models", sources._civitai_headers(token), {**params, "query": q[:80]})
         except Exception as exc:
-            log.info("Civitai search for %s failed: %s", filename, exc)
+            log.info("Civitai search %r for %s failed: %s", q, filename, exc)
             continue
+        exact = {}  # model id -> (model, version, file) whose file has this exact name
         for m in data.get("items") or []:
+            models_seen.setdefault(m.get("id"), m)
             for v in m.get("modelVersions") or []:
                 for f in v.get("files") or []:
-                    if (f.get("name") or "").lower() == filename.lower():
-                        return sources.civitai_version(v["id"], token, f.get("id"), bool(settings.get("show_nsfw")))
-    return None
+                    n = _norm_filename(f.get("name"))
+                    if n == want:
+                        exact.setdefault(m.get("id"), (m, v, f))
+                        continue
+                    # Near-identical names are often a sibling file or another model (ARCHER2 vs ARCHER),
+                    # so only longer names count, and the user confirms them.
+                    ratio = difflib.SequenceMatcher(None, n, want).ratio()
+                    if len(want) >= 10 and ratio >= 0.9 and (not likely or ratio > likely[0]):
+                        likely = (ratio, v["id"], f.get("id"))
+        if len(exact) > 1:
+            # Different models ship a file with this very name (two "Infrared.safetensors"): the user picks.
+            return {"confidence": "possible", "candidate": None,
+                    "possible": [_civitai_suggestion(m, show_nsfw, v, f) for m, v, f in list(exact.values())[:5]],
+                    "note": f"{len(exact)} different Civitai models have a file called {os.path.basename(filename)}: pick the one this workflow uses"}
+        for m, v, f in exact.values():
+            try:
+                return {"confidence": "exact", "candidate": sources.civitai_version(v["id"], token, f.get("id"), show_nsfw)}
+            except Exception as exc:  # unpublished / early-access versions 404 on their own
+                log.info("Civitai version %s for %s unavailable: %s", v["id"], filename, exc)
+    # Nothing with this file name: offer the models whose names look most like the file's words.
+    phrase = " ".join(words).lower()
+    scored = sorted(((difflib.SequenceMatcher(None, phrase, (m.get("name") or "").lower()).ratio(), m) for m in models_seen.values()),
+                    key=lambda x: (-x[0], -((x[1].get("stats") or {}).get("downloadCount") or 0)))
+    possible = [_civitai_suggestion(m, show_nsfw) for score, m in scored[:3] if phrase and score >= 0.45]
+    if likely:
+        try:
+            cand = sources.civitai_version(likely[1], token, likely[2], show_nsfw)
+            return {"confidence": "likely", "candidate": cand, "possible": possible}
+        except Exception as exc:
+            log.info("Civitai version %s unavailable: %s", likely[1], exc)
+    return {"confidence": "possible", "candidate": None, "possible": possible} if possible else None
 
 
 def find_model(filename, category, settings, library, embedded_url=""):
     """Best download candidate for a missing model file, with where it came from."""
     key = filename.lower()
     for item in library:
-        if (item.get("filename") or "").lower() == key:
+        names = [(item.get("filename") or "").lower()] + [a.lower() for a in item.get("aliases") or []]
+        if key in names:
+            # An alias is a file name a workflow used for this model (picked in the fixer): download under it.
             return {"origin": "library", "confidence": "exact",
-                    "candidate": {**item, "category": item.get("category") or category, "library_id": item["id"]}}
+                    "candidate": {**item, "filename": filename, "category": item.get("category") or category, "library_id": item["id"]}}
     if embedded_url:
         try:
             cand = sources.resolve(embedded_url, settings)
@@ -181,30 +281,50 @@ def find_model(filename, category, settings, library, embedded_url=""):
         except Exception as exc:
             log.info("Embedded URL for %s did not resolve: %s", filename, exc)
     found = []
-    m = manager_models().get(key)
-    if m:
-        cat = MANAGER_CATEGORY.get((m.get("type") or "").lower()) or category or sources.guess_category(filename)
-        found.append({"origin": "comfyui-manager", "confidence": "exact", "candidate": {
-            "source": "hf" if "huggingface.co" in m["url"] else "url", "name": m.get("name") or filename,
-            "filename": m["filename"], "url": m["url"], "category": category or cat,
-            "size": _size_to_bytes(m.get("size")), "sha256": "", "preview": "", "page_url": m.get("reference") or ""}})
+    generic = is_generic_name(filename)
+    for m in manager_models().get(key) or []:
+        mcat = MANAGER_CATEGORY.get((m.get("type") or "").lower())
+        if category and mcat and not _same_category(mcat, category):
+            continue  # e.g. the Kolors VAE offered for a ControlNet slot
+        if category and not mcat and not path_fits(m.get("save_path") or "", category):
+            continue
+        cand = {"source": "hf" if "huggingface.co" in m["url"] else "url", "name": m.get("name") or filename,
+                "filename": m["filename"], "url": m["url"], "category": category or mcat or sources.guess_category(filename),
+                "size": _size_to_bytes(m.get("size")), "sha256": "", "preview": "", "page_url": m.get("reference") or "",
+                "base_model": m.get("base") or ""}
+        found.append({"origin": "comfyui-manager", "confidence": "exact", "candidate": cand})
     try:
         hits = hf_index(wait=False).get(key) or []
     except Exception as exc:
         log.warning("HF index unavailable: %s", exc)
         hits = []
-    # Prefer the official Comfy-Org repackage, then the shortest path.
-    hits = sorted(hits, key=lambda h: (not h["repo"].startswith("Comfy-Org/"), len(h["path"])))
-    for hit in hits[:3]:
-        try:
-            cand = sources.hf_file(hit["repo"], hit["path"], token=settings.get("hf_token"))
-        except Exception:
-            cand = {"source": "hf", "name": filename, "filename": filename, "size": hit["size"], "sha256": "",
-                    "url": sources.hf_download_url(hit["repo"], hit["path"]), "preview": "",
-                    "page_url": f"https://huggingface.co/{hit['repo']}"}
+    # Only files in a folder that fits; prefer the official Comfy-Org repackage, then the shortest path.
+    hits = sorted((h for h in hits if path_fits(h["path"], category)),
+                  key=lambda h: (not h["repo"].startswith("Comfy-Org/"), len(h["path"])))
+    for hit in hits[: 6 if generic else 3]:
+        url = sources.hf_download_url(hit["repo"], hit["path"])
+        if generic:  # suggestions only: don't spend a request per file
+            folder = os.path.dirname(hit["path"])
+            cand = {"source": "hf", "name": hit["repo"] + (f" / {folder}" if folder else ""), "filename": filename, "size": hit["size"],
+                    "sha256": "", "url": url, "preview": "", "page_url": f"https://huggingface.co/{hit['repo']}"}
+        else:
+            try:
+                cand = sources.hf_file(hit["repo"], hit["path"], token=settings.get("hf_token"))
+            except Exception:
+                cand = {"source": "hf", "name": filename, "filename": filename, "size": hit["size"], "sha256": "",
+                        "url": url, "preview": "", "page_url": f"https://huggingface.co/{hit['repo']}"}
         cand["category"] = category or cand.get("category")
         found.append({"origin": f"huggingface:{hit['repo']}", "confidence": "exact", "candidate": cand,
                       "alternatives": [h["repo"] for h in hits if h is not hit][:4]})
+    if generic or sum(f["origin"] == "comfyui-manager" for f in found) > 1:
+        # Several different models answer to this name: the user picks.
+        possible = [_suggestion_from_candidate(f["candidate"]) for f in found]
+        if possible:
+            return {"origin": None, "confidence": "possible", "candidate": None, "possible": possible[:8],
+                    "note": (f"{len(possible)} different models are called {filename}: pick the one this workflow uses"
+                             if len(possible) > 1 else f"{filename} is a generic name: check this is the right model")}
+        if generic:
+            return None  # searching Civitai for "diffusion pytorch model" finds nothing useful
     if found:
         # Gated repos (licence not accepted, or no token) fail at download time, so pick one that opens.
         for f in found:
@@ -215,10 +335,13 @@ def find_model(filename, category, settings, library, embedded_url=""):
         f["note"] = ("Gated on Hugging Face: accept the licence on the model page"
                      + ("" if settings.get("hf_token") else " and add a Hugging Face token in Settings"))
         return f
-    cand = civitai_exact(filename, settings)
-    if cand:
-        cand["category"] = category or cand["category"]
-        return {"origin": "civitai", "confidence": "exact", "candidate": cand}
+    civ = civitai_find(filename, category, settings)
+    if civ and civ["candidate"]:
+        civ["candidate"]["category"] = category or civ["candidate"]["category"]
+        return {"origin": "civitai", "confidence": civ["confidence"], "candidate": civ["candidate"],
+                "possible": civ.get("possible") or []}
+    if civ:
+        return {"origin": None, "confidence": "possible", "candidate": None, "possible": civ["possible"], "note": civ.get("note")}
     return None
 
 
@@ -232,6 +355,56 @@ def _hf_accessible(url, token=""):
         except requests.RequestException:
             return True  # can't tell; let the download try
     return _cached(f"hf_access:{url}:{bool(token)}", 600, check)
+
+
+# File names that say nothing about the model: diffusers' defaults and the like. Hundreds of unrelated
+# models share them, so they're never matched by name alone; the user picks from suggestions.
+GENERIC_NAME = re.compile(r"^(diffusion_pytorch_model|pytorch_model|pytorch_lora_weights|model|adapter_model|consolidated|"
+                          r"unet|vae|transformer|controlnet|text_encoder|image_encoder|ip[-_]adapter|weights|lora)"
+                          r"([._-](fp16|bf16|fp32|\d+-of-\d+))*\.(safetensors|bin|pt|pth|ckpt|sft)$", re.I)
+# Folder words in a file's path (on Hugging Face, or Manager's save_path) per ComfyUI category.
+FOLDER_WORDS = {
+    "controlnet": ("controlnet", "control"), "vae": ("vae",), "loras": ("lora",),
+    "text_encoders": ("text_encoder", "clip", "t5"), "clip": ("text_encoder", "clip", "t5"),
+    "diffusion_models": ("diffusion_model", "unet", "transformer"), "unet": ("diffusion_model", "unet", "transformer"),
+    "checkpoints": ("checkpoint",), "upscale_models": ("upscale",), "clip_vision": ("clip_vision", "image_encoder"),
+    "embeddings": ("embedding",),
+}
+SAME_FOLDER = {"unet": "diffusion_models", "clip": "text_encoders"}
+
+
+def is_generic_name(filename):
+    return bool(GENERIC_NAME.match(os.path.basename(filename or "")))
+
+
+def _same_category(a, b):
+    a, b = config.normalize_category(a, default=""), config.normalize_category(b, default="")
+    return bool(a and b) and SAME_FOLDER.get(a, a) == SAME_FOLDER.get(b, b)
+
+
+def path_fits(path, category):
+    """False when a file's folders say it's another kind of model (vae/diffusion_pytorch_model.safetensors
+    is not a ControlNet). True when they agree or say nothing."""
+    if not category:
+        return True
+    folders = [p.lower() for p in re.split(r"[/\\]", path or "")[:-1]]
+
+    def says(cat):
+        return any(w in f for f in folders for w in FOLDER_WORDS.get(cat, ()))
+    if says(category) or says(SAME_FOLDER.get(category, category)):
+        return True
+    return not any(says(c) for c in FOLDER_WORDS if not _same_category(c, category))
+
+
+def base_family(text):
+    """Rough base-model family from a name or Civitai/Manager base label, for ranking suggestions."""
+    t = (text or "").lower()
+    for fam, words in (("flux", ("flux",)), ("krea", ("krea",)), ("qwen", ("qwen",)), ("wan", ("wan2", "wan_", "wan ")),
+                       ("sd3", ("sd3",)), ("sdxl", ("illustrious", "pony", "noob", "sdxl", "xl")),
+                       ("sd15", ("sd1.5", "sd15", "sd 1.5", "v1-5", "sd1"))):
+        if any(w in t for w in words):
+            return fam
+    return None
 
 
 def _size_to_bytes(text):
@@ -371,28 +544,37 @@ def manager_queue_status():
 # ---- the plan ----------------------------------------------------------------------------------
 def plan(workflow, library, settings, reported_missing_nodes=None):
     analysis = workflows.analyze(workflow, library)
+    # The workflow's base model family (from its checkpoint / diffusion model names), to rank suggestions.
+    fams = [base_family(m["filename"]) for m in analysis["models"] if m.get("category") in ("checkpoints", "diffusion_models", "unet")]
+    wf_family = max(set(f for f in fams if f), key=fams.count, default=None)
     out_models = []
     for m in analysis["models"]:
-        entry = {**m, "fix": None, "origin": None, "alternatives": []}
+        entry = {**m, "fix": None, "origin": None, "alternatives": [], "confidence": None, "possible": []}
         if m["status"] == "wrong_folder" and m["category"]:
             entry["fix"] = {"kind": "move", "from": m["installed_in"][0], "to": m["category"]}
         elif m["status"] != "installed":
             found = find_model(m["filename"], m["category"], settings, library, m.get("url") or "")
             if found:
+                possible = found.get("possible") or []
+                for p in possible:
+                    p["fits_base"] = bool(wf_family) and base_family(f"{p.get('base_model')} {p.get('name')}") == wf_family
+                possible.sort(key=lambda p: not p["fits_base"])
+                entry.update(confidence=found.get("confidence"), possible=possible, note=found.get("note"))
+            if found and found.get("candidate"):
                 cand = found["candidate"]
                 entry.update(origin=found["origin"], alternatives=found.get("alternatives", []),
                              preview=cand.get("preview") or entry.get("preview"),
                              fix={"kind": "download", "candidate": {k: v for k, v in cand.items() if k not in ("versions",)},
                                   "size": cand.get("size") or 0})
                 entry["category"] = entry["category"] or cand.get("category")
-                entry["note"] = found.get("note")
         out_models.append(entry)
     nodes_error = ""
     try:
         nodes = missing_nodes(workflow, reported_missing_nodes)
     except Exception as exc:
         nodes, nodes_error = [], str(exc)
-    auto = [e for e in out_models if e["fix"] and not (e["fix"].get("candidate") or {}).get("gated")]
+    # Gated files need a licence accepted, and "likely" (near-identical file name) matches need a look.
+    auto = [e for e in out_models if e["fix"] and not (e["fix"].get("candidate") or {}).get("gated") and e["confidence"] != "likely"]
     need = sum(e["fix"]["size"] for e in auto if e["fix"]["kind"] == "download")
     free = shutil.disk_usage(config.WORKSPACE).free if config.WORKSPACE.exists() else None
     unresolved = [e["filename"] for e in out_models if e["status"] != "installed" and not e["fix"]]
