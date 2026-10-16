@@ -45,7 +45,18 @@ build_sage2(){
   elif [[ -x /usr/local/cuda/bin/nvcc ]]; then nvcc_dir=/usr/local/cuda/bin
   else log "WARN: nvcc not found; cannot build SageAttention 2"; return 1
   fi
-  jobs="$(nproc)"; (( jobs > 16 )) && jobs=16
+  # SageAttention's setup.py runs every nvcc with --threads=8 and each job can
+  # take several GB of RAM; too many jobs froze a 12-core / 32 GB host (OOM).
+  # Allow one job per 4 cores and per 8 GB of RAM, between 2 and 8.
+  # /proc/meminfo shows the host's RAM inside a container; the cgroup limit is the real cap.
+  local mem_bytes lim f
+  mem_bytes=$(( $(awk '/MemTotal/ {print $2}' /proc/meminfo) * 1024 ))
+  for f in /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory/memory.limit_in_bytes; do
+    lim="$(cat "$f" 2>/dev/null || true)"
+    [[ "$lim" =~ ^[0-9]+$ ]] && (( lim < mem_bytes )) && mem_bytes=$lim
+  done
+  jobs=$(( $(nproc) / 4 )); (( mem_bytes / 8589934592 < jobs )) && jobs=$(( mem_bytes / 8589934592 ))
+  (( jobs < 2 )) && jobs=2; (( jobs > 8 )) && jobs=8
   # The image ships nvcc but not the full CUDA dev headers (e.g. cusparse.h);
   # torch's pip-installed nvidia/* packages carry them, so add those paths.
   nv_inc="$("$COMFY_PY" -c 'import glob, os, site; print(":".join(sorted(glob.glob(os.path.join(site.getsitepackages()[0], "nvidia", "*", "include")))))' 2>/dev/null || true)"
