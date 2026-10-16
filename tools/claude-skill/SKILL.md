@@ -12,8 +12,8 @@ Python install that owns `vastai`. It reaches the instance over SSH, so the user
 
 ```
 python xtra.py status [ID] [--json]      # instances + dashboard, ComfyUI, GPU use, disk, host health
-python xtra.py offers [--gpu RTX_5090,RTX_4090] [--max-price 0.8] [--min-vram 24] [--rank value|speed] [--for WORKFLOW.json] [--json]
-python xtra.py rent [same options] [--auto-swap] [--bundles a,b] [--keep-models] [--set KEY=VALUE] [--yes] [--dry-run]
+python xtra.py offers [--gpu RTX_5090,RTX_4090] [--max-price 0.8] [--min-vram 24] [--rank value|speed] [--for WORKFLOW.json] [--disk 100] [--json]
+python xtra.py rent --offer ID [--disk 100] [--bundles a,b] [--keep-models] [--set KEY=VALUE] --yes [--dry-run]
 python xtra.py needs WORKFLOW.json       # VRAM and download size a workflow needs (no instance required)
 python xtra.py hosts [--forget ID|all]   # machines skipped after failing the host check
 python xtra.py tunnel [ID]               # dashboard http://localhost:17890, ComfyUI http://localhost:17891 (blocks; run in background)
@@ -23,33 +23,61 @@ python xtra.py logs [ID]
 python xtra.py stop|start|destroy ID
 ```
 
+## Renting safely (read before every rental)
+
+Renting spends the user's money. Follow this every time, even when the user says "just rent one":
+
+1. **Search with the user's real numbers.** Use their disk size (`--disk`), their workflow (`--for`) or ask
+   what they'll run, and their budget (`--max-price`). Don't invent `--download-gb` or `--hours`: they decide
+   how much the download fee weighs. If you must guess, say what you assumed.
+2. **Show before you rent.** For the top 2-3 offers give: offer ID, GPU + VRAM, location, $/h (GPU + disk),
+   **download price in $/TB**, network speed, host score, and which you'd pick and why. Wait for the user to
+   pick one in chat.
+3. **Rent exactly that offer:** `rent --offer <ID> --disk <GB> --yes`. If it's gone, `--offer` rents nothing.
+   Then search again and **ask again**. Never let the helper fall through to the "next best" offer the user
+   hasn't seen, and don't use `--auto-swap` unless the user asked for it (it rents unseen hosts).
+4. **Bandwidth is not a footnote.** Hosts set their own download price: most charge $0-5/TB, a few $40+/TB.
+   Models are re-downloaded on every new instance (about 20 GB for a MiniMax/Krea set, 60 GB+ for video
+   stacks), so it's a recurring cost. The helper hides hosts over $10/TB; raise `--max-download-per-tb` only
+   if the user asks.
+5. **If the user says stop, stop first:** kill the running `rent`, destroy (or stop, if it holds their data)
+   what was just rented, confirm with `status`, then explain.
+
+**What went wrong once (2026-10-16), so it doesn't again:** the user asked for "at least a 4090, 50 GB disk".
+The best offer (RTX 4090, Bulgaria, $0.53/h) was taken a minute later, and `rent` (no `--offer`) silently took
+the next one: an RTX 5090 in Estonia charging **$40/TB** to download. It ranked "best value" only because the
+fee was spread over an assumed 4-hour session, and the $/TB was never shown. The user had to stop it. Cheaper,
+faster hosts at $1-4/TB were available. Hence rules 2-4 and the `--offer` flag.
+
 ## How to work
 
 - **Start by looking.** Run `status --json` to learn what is running before anything else. "Acknowledge the
   current session" means this: report GPU, price, uptime-relevant state, whether ComfyUI is busy
   (`api system` → `comfy.queue_remaining`, `gpus[0].util`), active downloads (`api downloads`) and host health.
 - **Money and destruction need a yes.** Renting, `start`, `stop` and `destroy` cost money or lose data. Show
-  the offer (GPU, $/h, location) or the instance (ID, GPU, what's on it) and wait for the user's explicit
-  go-ahead in chat. `rent` without `--yes` prompts interactively, which you can't answer, so pass `--yes`
-  only after the user agreed to that specific offer. Never destroy an instance you didn't just rent for a
-  test unless the user names it. Destroying deletes the instance's disk; a `--keep-models` volume survives.
+  the offer (see above) or the instance (ID, GPU, what's on it) and wait for the user's explicit go-ahead in
+  chat. `rent` without `--yes` prompts interactively, which you can't answer, so pass `--yes` only together
+  with `--offer` for the offer the user agreed to. Never destroy an instance you didn't just rent for a test
+  unless the user names it. Destroying deletes the instance's disk; a `--keep-models` volume survives.
 - **Picking a GPU.** `offers` applies the template's host-quality filters (reliability ≥ 0.98, ≥ 800 Mbps,
   fast disk, no display attached, ≥ 32 GB RAM, CUDA ≥ 12.9), hides hosts scoring well below others with the
-  same GPU (power-limited or throttled; HOST column) and machines that failed a host check in the last 30 days.
-  Prices are real costs: GPU + disk per hour plus the host's download fee for the models, spread over `--hours`.
-  `--rank value` (default) = most images per dollar; `--rank speed` = fastest within `--max-price`. If the user
-  names a workflow, pass `--for` so VRAM and download size come from it; otherwise ask what they'll run.
-  IMG/H marked `~` is an estimate from a built-in speed table; unmarked numbers are the user's own benchmarks.
-  Present the top 2-3 with real $/h, the one-off download fee and images/hour, and say which you'd pick and why.
+  same GPU (power-limited or throttled; HOST column), hosts over $10/TB to download, and machines that failed
+  a host check in the last 30 days. $/H is GPU + disk plus the download fee spread over `--hours`; DL $/TB is
+  the host's download price. `--rank value` (default) = most images per dollar; `--rank speed` = fastest
+  within `--max-price`. IMG/H marked `~` is an estimate from a built-in speed table; unmarked numbers are the
+  user's own benchmarks. Suggest 16 GB for SDXL/Flux-fp8, 24 GB for Flux/Qwen-Image/Wan 14B fp8, 32 GB+ for
+  video. Offers change by the minute: re-run `offers` right before renting.
 - **After renting**, `rent` waits for the dashboard and the host check (about 2 minutes in all). A `poor` host
-  is remembered and skipped from then on. With `--auto-swap` (only when the user agreed to it) it destroys a
-  poor host and rents the next best, up to `--max-swaps` (2) times; mention that each swap costs a few cents.
+  or one that never starts its container (stuck loading over 8 minutes) is remembered and skipped from then on;
+  without `--auto-swap` tell the user and offer to destroy it and pick another offer together.
   The first rental of a GPU model the user hasn't benchmarked runs the 2-minute benchmark automatically
   (`--no-bench` to skip), so later rankings use real numbers.
-- **Missing models or nodes.** `fix` shows what's missing. The fix itself runs inside ComfyUI (⚡ Xtra tab)
-  or by posting the `models` entries (each carries its `fix`) and the pack ids from `fix --json` to
+- **Missing models or nodes.** `fix` shows what's missing, what's optional (switched-off nodes) and where each
+  file would come from. The fix itself runs inside ComfyUI (⚡ Xtra tab) or by posting the `models` entries
+  (each carries its `fix`) and the pack ids from `fix --json` to
   `api fix/apply -X POST -d '{"models": [...], "packs": [...]}'`. Prefer pointing the user to the ⚡ Xtra
-  tab: it shows sizes and asks before installing node packs.
+  tab: it shows sizes and asks before installing node packs. When testing, don't download big models (tens of
+  GB) unless the user asked: use small files to check paths.
 - **Keep models between instances.** `rent --keep-models` creates (first time) or links (afterwards) a Vast
   local volume labelled `comfy-xtra-models`, mounted at `/mnt/models`. Local volumes are tied to one machine,
   so later rentals must use that machine; if it has no free GPU, say so rather than renting elsewhere silently.

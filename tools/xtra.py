@@ -6,7 +6,7 @@ added at vast.ai/account). Talks to the Comfy-Xtra dashboard on the instance ove
 portal token is needed.
 
   xtra offers [--gpu RTX_4090,RTX_5090] [--max-price 0.8] [--min-vram 16] [--rank value|speed] [--for WORKFLOW]
-  xtra rent   [same filters] [--disk 100] [--bundles a,b] [--auto-swap] [--keep-models] [--yes] [--dry-run]
+  xtra rent   [same filters] [--offer ID] [--disk 100] [--bundles a,b] [--auto-swap] [--keep-models] [--yes] [--dry-run]
   xtra needs WORKFLOW       VRAM and download size a workflow needs
   xtra status [ID]          instances + dashboard / GPU / host health
   xtra hosts [--forget ID|all]   machines skipped because they failed the host check
@@ -67,6 +67,9 @@ RELATIVE_SPEED = {
     "rtx pro 6000 max-q": 1.3,
 }
 VRAM_TIERS = (8, 10, 12, 16, 20, 24, 32, 40, 48, 80, 96, 141)
+# Hosts set their own bandwidth price; most charge $0-5 per TB, a few $40+. Above this they're hidden:
+# models are re-downloaded on every new instance, so the fee isn't really one-off.
+MAX_DOWNLOAD_PER_TB = 10.0
 
 
 # ---- helpers --------------------------------------------------------------------------------
@@ -407,7 +410,8 @@ def _typical(values):
     return values[int(len(values) * 0.75)] if len(values) >= 4 else values[-1]
 
 
-def rank_offers(offers, benchmarks, disk_gb=100, download_gb=20, hours=4, mode="value", allow_slow=False, bad=None):
+def rank_offers(offers, benchmarks, disk_gb=100, download_gb=20, hours=4, mode="value", allow_slow=False, bad=None,
+                max_download_per_tb=MAX_DOWNLOAD_PER_TB):
     """Annotate offers with real cost, expected speed and value; return (ranked, hidden_counts)."""
     by_model = {}
     for o in offers:
@@ -434,7 +438,7 @@ def rank_offers(offers, benchmarks, disk_gb=100, download_gb=20, hours=4, mode="
         if relative(model):
             per_4090.append(ips / relative(model))
     ips_4090 = statistics.median(per_4090)
-    hidden = {"slow": 0, "bad": 0}
+    hidden = {"slow": 0, "bad": 0, "bandwidth": 0}
     out = []
     for o in offers:
         model = norm_gpu(o.get("gpu_name"))
@@ -447,6 +451,10 @@ def rank_offers(offers, benchmarks, disk_gb=100, download_gb=20, hours=4, mode="
             continue
         if perf < SLOW_HOST and not allow_slow:
             hidden["slow"] += 1
+            continue
+        o["_dl_tb"] = (o.get("inet_down_cost") or 0) * 1000
+        if max_download_per_tb is not None and o["_dl_tb"] > max_download_per_tb:
+            hidden["bandwidth"] += 1
             continue
         measured = model in per_model
         base = statistics.median(per_model[model]) if measured else ips_4090 * (relative(model) or 0.3)
@@ -474,7 +482,7 @@ def search_offers(a, machine_id=None, bad=None, shared=None):
     offers = vast("search", "offers", q, "--storage", str(a.disk), "-o", order, "--limit", "400") or []
     shared = shared if shared is not None else shared_data(a.refresh)
     ranked, hidden = rank_offers(offers, shared.get("benchmarks"), a.disk, a.download_gb, a.hours, a.rank,
-                                 a.allow_slow, bad if bad is not None else bad_hosts(shared))
+                                 a.allow_slow, bad if bad is not None else bad_hosts(shared), a.max_download_per_tb)
     if a.max_price:
         ranked = [o for o in ranked if o["_cost_h"] <= a.max_price]
     return ranked, hidden
@@ -509,6 +517,8 @@ def describe_hidden(hidden, a):
         parts.append(f"{hidden['slow']} slow host(s) (well below others with the same GPU; --allow-slow to show)")
     if hidden["bad"]:
         parts.append(f"{hidden['bad']} host(s) that failed your host check (xtra hosts)")
+    if hidden.get("bandwidth"):
+        parts.append(f"{hidden['bandwidth']} host(s) charging over ${a.max_download_per_tb:g}/TB to download (--max-download-per-tb)")
     return ("Hidden: " + "; ".join(parts)) if parts else ""
 
 
@@ -516,7 +526,7 @@ def describe_hidden(hidden, a):
 def offer_row(o):
     return {"id": o["id"], "machine_id": o.get("machine_id"), "gpu": o["gpu_name"], "vram_gb": round(o["gpu_ram"] / 1024),
             "cost_per_hour": round(o["_cost_h"], 4), "gpu_disk_per_hour": round(o["_hourly"], 4),
-            "download_fee": round(o["_fee"], 3), "images_per_hour": round(o["_ips"]), "speed_measured": o["_measured"],
+            "download_fee": round(o["_fee"], 3), "download_per_tb": round(o["_dl_tb"], 2), "images_per_hour": round(o["_ips"]), "speed_measured": o["_measured"],
             "images_per_dollar": round(o["_ipd"]), "host_perf": round(o["_perf"], 2), "inet_down_mbps": o.get("inet_down"),
             "disk_mbps": o.get("disk_bw"), "where": o.get("geolocation")}
 
@@ -530,12 +540,13 @@ def cmd_offers(a):
         return
     if needs:
         print(describe_needs(needs) + "\n")
-    print(f"{'ID':>9}  {'GPU':<16} {'VRAM':>4} {'$/H':>7} {'+FEE':>6} {'IMG/H':>7} {'IMG/$':>7} {'HOST':>5} {'NET':>5}  WHERE")
+    print(f"{'ID':>9}  {'GPU':<16} {'VRAM':>4} {'$/H':>7} {'DL $/TB':>8} {'IMG/H':>7} {'IMG/$':>7} {'HOST':>5} {'NET':>5}  WHERE")
     for o in offers:
-        print(f"{o['id']:>9}  {o['gpu_name'][:16]:<16} {o['gpu_ram'] / 1024:>3.0f}G {o['_cost_h']:>7.3f} ${o['_fee']:>5.2f} "
+        print(f"{o['id']:>9}  {o['gpu_name'][:16]:<16} {o['gpu_ram'] / 1024:>3.0f}G {o['_cost_h']:>7.3f} {o['_dl_tb']:>8.2f} "
               f"{o['_ips']:>6.0f}{' ' if o['_measured'] else '~'} {o['_ipd']:>7.0f} {o['_perf'] * 100:>4.0f}% "
               f"{o['inet_down'] / 1000:>4.1f}G  {(o.get('geolocation') or '')[:22]}")
-    print(f"\n$/H = GPU + {a.disk} GB disk + download fee for {a.download_gb:g} GB spread over {a.hours:g} h; +FEE = that one-off fee. "
+    print(f"\n$/H = GPU + {a.disk} GB disk + download fee for {a.download_gb:g} GB spread over {a.hours:g} h. "
+          f"DL $/TB = what the host charges to download (hosts over ${a.max_download_per_tb:g}/TB are hidden). "
           "IMG/H = SD 1.5 512px images per hour (~ = estimated, no benchmark of yours for that GPU yet). "
           "HOST = this host's score vs. healthy hosts with the same GPU.")
     if describe_hidden(hidden, a):
@@ -575,6 +586,12 @@ def cmd_rent(a):
     shared = shared_data(a.refresh)
     bad = bad_hosts(shared)
     offers, hidden = search_offers(a, machine, bad, shared)
+    if a.offer:
+        # Exactly the offer the user approved, or nothing: never fall through to one they haven't seen.
+        offers = [o for o in offers if o["id"] == a.offer]
+        if not offers:
+            die(f"offer {a.offer} is no longer available (rented by someone else, or now outside your filters). "
+                "Nothing was rented; run `xtra offers` again and pick another.")
     vol_offers = {}
     if a.keep_models and not machine:
         # A new local volume must be created on the same machine as the instance.
@@ -585,7 +602,7 @@ def cmd_rent(a):
             (", or the volume's machine is busy" if machine else ", or drop --keep-models: few machines offer volumes" if a.keep_models else "") + ")"
             + (f". {describe_hidden(hidden, a)}" if describe_hidden(hidden, a) else ""))
     env_args = " ".join(f"-e {k}={v}" for k, v in env.items())
-    tries = 1 + (a.max_swaps if a.auto_swap else 0)
+    tries = 1 + (a.max_swaps if a.auto_swap and not a.offer else 0)  # --offer: no swaps to unseen hosts
     spent = 0.0
     for attempt in range(tries):
         offers = [o for o in offers if str(o["machine_id"]) not in bad]
@@ -598,7 +615,7 @@ def cmd_rent(a):
             vol_extra = ["--create-volume", str(vol_offer["id"]), "--volume-size", str(a.volume_size), "--mount-path", VOLUME_MOUNT,
                          "--volume-label", VOLUME_LABEL]
         print(f"{'Best' if attempt == 0 else 'Next'} offer: {o['gpu_name']} {o['gpu_ram'] / 1024:.0f} GB in {o.get('geolocation')} (offer {o['id']})\n"
-              f"  {money(o['_hourly'])} GPU + {a.disk} GB disk, ${o['_fee']:.2f} to download {a.download_gb:g} GB "
+              f"  {money(o['_hourly'])} GPU + {a.disk} GB disk; downloads cost ${o.get('_dl_tb', 0):.2f}/TB (${o['_fee']:.2f} for {a.download_gb:g} GB) "
               f"-> {money(o['_cost_h'])} over {a.hours:g} h\n"
               f"  about {o['_ips']:.0f} images/hour{'' if o['_measured'] else ' (estimated)'}, {o['_ipd']:.0f} images per dollar; "
               f"host scores {o['_perf'] * 100:.0f}% of a healthy {o['gpu_name']}; {o['inet_down'] / 1000:.1f} Gbps, disk {o['disk_bw'] / 1000:.1f} GB/s")
@@ -832,6 +849,8 @@ def add_offer_args(p):
     p.add_argument("--download-gb", type=float, default=None, help="GB of models you'll download (default 20, or from --for)")
     p.add_argument("--hours", type=float, default=4, help="how long you'll use it, to spread the download fee (default 4)")
     p.add_argument("--allow-slow", action="store_true", help="also show hosts scoring well below others with the same GPU")
+    p.add_argument("--max-download-per-tb", type=float, default=MAX_DOWNLOAD_PER_TB,
+                   help=f"hide hosts charging more than this per TB downloaded (default ${MAX_DOWNLOAD_PER_TB:g})")
     p.add_argument("--refresh", action="store_true", help="re-read your benchmarks and host verdicts now")
 
 
@@ -849,6 +868,7 @@ def main():
     p = sub.add_parser("rent", help="rent the best matching host with your template")
     add_offer_args(p)
     p.add_argument("--bundles", help="bundles to auto-install, comma separated")
+    p.add_argument("--offer", type=int, help="rent exactly this offer id (from `xtra offers`), or nothing if it's gone")
     p.add_argument("--auto-swap", action="store_true", help="if the host check fails, destroy it and rent the next best host")
     p.add_argument("--max-swaps", type=int, default=2)
     p.add_argument("--no-bench", action="store_true", help="don't benchmark GPU models you haven't measured yet")

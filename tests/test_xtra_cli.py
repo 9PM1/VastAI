@@ -73,7 +73,7 @@ class Ranking(unittest.TestCase):
         self.assertIn(3, [o["id"] for o in ranked])
 
     def test_download_fee_counts(self):
-        ranked, _ = xtra.rank_offers([dict(o) for o in self.offers], [], download_gb=50, hours=4)
+        ranked, _ = xtra.rank_offers([dict(o) for o in self.offers], [], download_gb=50, hours=4, max_download_per_tb=None)
         by = {o["id"]: o for o in ranked}
         self.assertAlmostEqual(by[2]["_fee"], 0.78, places=2)
         self.assertGreater(by[2]["_cost_h"], by[1]["_cost_h"])  # "cheaper" listing is dearer in practice
@@ -93,6 +93,14 @@ class Ranking(unittest.TestCase):
         self.assertEqual(speed[0]["id"], 4)  # fastest healthy 5090
         by = {o["id"]: o for o in speed}
         self.assertAlmostEqual(by[4]["_ips"] / by[5]["_ips"], 1.35 / .38, delta=0.05)
+
+    def test_expensive_bandwidth_hidden(self):
+        offers = [dict(o) for o in self.offers] + [offer(6, "RTX 5090", 200, 0.50, 16, fee=0.039)]  # $39/TB
+        ranked, hidden = xtra.rank_offers(offers, [], download_gb=20)
+        self.assertNotIn(6, [o["id"] for o in ranked])
+        self.assertEqual(hidden["bandwidth"], 2)  # offer 2 charges $15.6/TB too
+        ranked, _ = xtra.rank_offers([dict(o) for o in offers], [], max_download_per_tb=None)
+        self.assertIn(6, [o["id"] for o in ranked])
 
     def test_bad_hosts_skipped(self):
         ranked, hidden = xtra.rank_offers([dict(o) for o in self.offers], [], bad={"11": {}})
@@ -128,7 +136,7 @@ class BadHostMemory(unittest.TestCase):
 class AutoSwap(unittest.TestCase):
     """rent --auto-swap with Vast faked: the first host fails the check, the second passes."""
 
-    def run_rent(self, auto_swap, healths, wait_ready=None):
+    def run_rent(self, auto_swap, healths, wait_ready=None, extra=()):
         calls, saved = [], {}
         offers = [dict(offer(i, "RTX 4090", 96, 0.5 + i / 100, 100 + i), _hourly=0.5, _fee=0.1, _cost_h=0.53, _ips=8900,
                        _ipd=16000, _perf=1.0, _measured=True, inet_down=1000, disk_bw=3000, geolocation="X") for i in (1, 2, 3)]
@@ -147,7 +155,7 @@ class AutoSwap(unittest.TestCase):
             setattr(xtra, k, v)
         try:
             xtra.save_json(xtra.BAD_HOSTS_FILE, {})
-            args = ["rent", "--yes", "--gpu", "RTX_4090"] + (["--auto-swap"] if auto_swap else [])
+            args = ["rent", "--yes", "--gpu", "RTX_4090"] + (["--auto-swap"] if auto_swap else []) + list(extra)
             import sys
             argv, sys.argv = sys.argv, ["xtra"] + args
             try:
@@ -174,6 +182,18 @@ class AutoSwap(unittest.TestCase):
         calls = self.run_rent(True, [{"score": "good", "warnings": []}], wait_ready=stuck_then_ok)
         self.assertEqual([c[:3] for c in calls], [("create", "instance", "1"), ("destroy", "instance", "901"), ("create", "instance", "2")])
         self.assertIn("101", xtra.bad_hosts())
+
+    def test_offer_rents_exactly_that_offer(self):
+        calls = self.run_rent(False, [{"score": "good", "warnings": []}], extra=["--offer", "2"])
+        self.assertEqual([c[:3] for c in calls], [("create", "instance", "2")])
+
+    def test_gone_offer_rents_nothing(self):
+        with self.assertRaises(SystemExit):
+            self.run_rent(True, [], extra=["--offer", "999"])
+
+    def test_offer_never_swaps_to_an_unseen_host(self):
+        calls = self.run_rent(True, [{"score": "poor", "warnings": ["x4 PCIe"]}], extra=["--offer", "1"])
+        self.assertEqual([c[0] for c in calls], ["create"])
 
     def test_without_auto_swap_keeps_it(self):
         calls = self.run_rent(False, [{"score": "poor", "warnings": ["x4 PCIe"]}])
