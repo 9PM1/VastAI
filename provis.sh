@@ -59,7 +59,7 @@ PYJSON
 
 log "Starting Comfy-Xtra provisioning"
 log "Python: $PYTHON_BIN"
-send_discord "⚙️ Provisioning Started" "Comfy-Xtra setup started on `$(hostname)`." 3447003
+send_discord "⚙️ Provisioning Started" "Comfy-Xtra setup started on \`$(hostname)\`." 3447003
 
 # Wait for apt/dpkg locks rather than racing cloud-init.
 if command -v fuser >/dev/null 2>&1; then
@@ -71,7 +71,10 @@ fi
 
 retry 5 apt-get update -y
 retry 5 apt-get install -y --no-install-recommends aria2 ca-certificates curl jq psmisc openssl git procps
-retry 5 "$PYTHON_BIN" -m pip install --no-cache-dir -U certifi 'pymongo[srv]' huggingface_hub hf_xet
+# huggingface_hub is shared with ComfyUI's transformers, which pins its major
+# version: install it only if missing instead of force-upgrading it.
+retry 5 "$PYTHON_BIN" -m pip install --no-cache-dir -U certifi 'pymongo[srv]'
+retry 5 "$PYTHON_BIN" -m pip install --no-cache-dir huggingface_hub hf_xet
 
 COMFY_BASE=/workspace/ComfyUI/models
 for folder in audio_encoders background_removal checkpoints ckpt clip clip_vision configs controlnet detection diffusers diffusion_models embeddings frame_interpolation geometry_estimation gligen hypernetworks latent_upscale_models loras model_patches optical_flow photomaker style_models text_encoders unet upscale_models vae vae_approx; do
@@ -134,7 +137,9 @@ GROUPS_COL = "groups"
 
 LOCAL_DB_PATH = "/workspace/model_manager.db"
 COMFY_BASE = "/workspace/ComfyUI/models"
-COMFY_INTERNAL_URL = "http://127.0.0.1:8188"
+# Port 8188 is Vast's authenticated Caddy proxy; ComfyUI itself listens on 18188.
+COMFY_INTERNAL_URL = (os.environ.get("COMFYUI_API_BASE") or "http://127.0.0.1:18188").rstrip("/")
+HF_STAGING_DIR = "/workspace/.comfy_xtra_staging"
 MAX_TASK_RETRIES = max(0, int(os.environ.get("COMFY_XTRA_MAX_TASK_RETRIES", "3")))
 
 logging.basicConfig(
@@ -295,6 +300,18 @@ def get_all_settings():
     if "discord_webhook" not in settings and DISCORD_WEBHOOK_ENV:
         settings["discord_webhook"] = DISCORD_WEBHOOK_ENV
     return settings
+
+SETTINGS_KEYS = {"hf_token", "civitai_token", "discord_webhook"}
+SECRET_MASK = "••••"
+
+def masked_settings():
+    # Never send stored secrets back to the browser; show only the last 4 chars.
+    masked = {}
+    for k, v in get_all_settings().items():
+        if k in SETTINGS_KEYS and v:
+            v = str(v)
+            masked[k] = SECRET_MASK + (v[-4:] if len(v) > 12 else "")
+    return masked
 
 def save_settings(data_dict):
     db = get_mongo_db()
@@ -660,6 +677,16 @@ def human_size(size_bytes):
         size_bytes /= 1024.0
     return f"{size_bytes:.1f} TB"
 
+def dir_size(path):
+    total = 0
+    for root, _, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return total
+
 def format_eta(seconds):
     if seconds < 0 or seconds > 86400:
         return "--"
@@ -743,25 +770,59 @@ def hf_worker(task_id, target_url, dest_dir, custom_filename, token, is_startup=
         })
         return
 
+    token = token.strip() if token else None
+    total_bytes = 0
+    try:
+        from huggingface_hub import get_hf_file_metadata, hf_hub_url
+        file_meta = get_hf_file_metadata(hf_hub_url(repo_id, file_path, revision=revision), token=token)
+        total_bytes = int(file_meta.size or 0)
+    except Exception as exc:
+        logger.info("Could not read Hugging Face file size for %s: %s", file_path, exc)
+
     download_tasks[task_id].update({
         "status": "Downloading (Hugging Face)", "file": final_name,
         "title": f"{repo_id} - {final_name}",
         "image_url": "https://huggingface.co/front/assets/huggingface_logo-noborder.svg",
-        "progress": 10, "downloaded_bytes": 0, "total_bytes": 0,
+        "progress": 0, "downloaded_bytes": 0, "total_bytes": total_bytes,
         "speed": "HF/Xet", "eta": "Downloading...", "error_log": ""
     })
 
+    # Download into a per-task staging dir outside the model folders so the
+    # .cache/ metadata and nested repo sub-folders never show up in ComfyUI.
+    staging = os.path.join(HF_STAGING_DIR, task_id)
+    shutil.rmtree(staging, ignore_errors=True)
+    os.makedirs(staging, exist_ok=True)
+    done = threading.Event()
+
+    def monitor_progress():
+        # hf_xet writes in large bursts, so per-second deltas are mostly zero;
+        # report the average rate since the download started instead.
+        started = time.time()
+        while not done.wait(1.0):
+            task = download_tasks.get(task_id) or {}
+            if task.get("status") == "Cancelled":
+                return
+            curr = dir_size(staging)
+            speed_bps = curr / max(time.time() - started, 1e-6)
+            update = {"downloaded_bytes": curr, "speed": f"{human_size(speed_bps)}/s"}
+            if total_bytes > 0:
+                update["progress"] = min(99, int(curr * 100 / total_bytes))
+                update["eta"] = format_eta((total_bytes - curr) / speed_bps) if speed_bps > 0 else "--"
+            task.update(update)
+
+    monitor = threading.Thread(target=monitor_progress, daemon=True)
+    monitor.start()
     try:
         from huggingface_hub import hf_hub_download
         local_path = hf_hub_download(
             repo_id=repo_id, filename=file_path, revision=revision,
-            token=token.strip() if token else None, local_dir=dest_dir,
+            token=token, local_dir=staging,
         )
+        done.set()
+        monitor.join(timeout=3)
         if download_tasks[task_id].get("status") == "Cancelled":
             return
-        if os.path.realpath(local_path) != os.path.realpath(target_file):
-            os.makedirs(os.path.dirname(target_file), exist_ok=True)
-            os.replace(local_path, target_file)
+        os.replace(local_path, target_file)
         final_sz = os.path.getsize(target_file)
         if final_sz <= 1024:
             raise RuntimeError("Downloaded file is unexpectedly small")
@@ -773,7 +834,11 @@ def hf_worker(task_id, target_url, dest_dir, custom_filename, token, is_startup=
         send_discord_notification(evt_title, f"**{final_name}** ({human_size(final_sz)}) downloaded from Hugging Face to `{os.path.basename(dest_dir)}`", 0x238636)
     except Exception as exc:
         logger.warning("Hugging Face download failed for %s: %s", repo_id, exc)
-        download_tasks[task_id].update({"status": "Failed", "error_log": f"Hugging Face: {exc}"})
+        if download_tasks[task_id].get("status") != "Cancelled":
+            download_tasks[task_id].update({"status": "Failed", "error_log": f"Hugging Face: {exc}"})
+    finally:
+        done.set()
+        shutil.rmtree(staging, ignore_errors=True)
 
 def civitai_curl_worker(task_id, target_url, dest_dir, custom_filename, token, meta=None, is_startup=False):
     meta = meta or fetch_civitai_meta(target_url) or {}
@@ -819,10 +884,11 @@ def civitai_curl_worker(task_id, target_url, dest_dir, custom_filename, token, m
         "error_log": ""
     })
 
+    # "-C -" resumes from an existing .part file left by a failed attempt.
     cmd = [
         "curl", "-L", "-A", "Mozilla/5.0", "--fail", "--silent", "--show-error",
         "--retry", "5", "--retry-delay", "3", "--retry-all-errors",
-        "--connect-timeout", "15", "--max-time", "0", "-o", temp_file, url
+        "--connect-timeout", "15", "--max-time", "0", "-C", "-", "-o", temp_file, url
     ]
     if token:
         cmd[1:1] = ["--header", f"Authorization: Bearer {token.strip()}"]
@@ -830,7 +896,7 @@ def civitai_curl_worker(task_id, target_url, dest_dir, custom_filename, token, m
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         active_processes[task_id] = proc
         download_tasks[task_id]["status"] = "Downloading"
-        last_bytes = 0
+        last_bytes = os.path.getsize(temp_file) if os.path.exists(temp_file) else 0
         last_time = time.time()
 
         while proc.poll() is None:
@@ -887,6 +953,10 @@ def civitai_curl_worker(task_id, target_url, dest_dir, custom_filename, token, m
             desc = f"**{download_tasks[task_id].get('title', final_name)}**\nSaved as `{final_name}` ({human_size(final_sz)}) to `{os.path.basename(dest_dir)}`"
             send_discord_notification(evt_title, desc, 0x238636, download_tasks[task_id].get("image_url"))
         else:
+            if ret in (33, 36) and os.path.exists(temp_file):
+                # Server refused to resume; drop the partial so the retry starts fresh.
+                try: os.remove(temp_file)
+                except Exception: pass
             detail = (curl_error or "").strip()[-500:]
             message = f"Download failed (curl code {ret})"
             if detail:
@@ -929,11 +999,14 @@ def aria2_worker(task_id, target_url, dest_dir, custom_filename, token, is_start
         "error_log": ""
     })
 
+    started_at = time.time()
     try:
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
         active_processes[task_id] = process
         progress_pattern = re.compile(r'\((\d+)%\).*DL:([^\s\]]+)(?:.*ETA:([^\s\]]+))?')
-        file_pattern = re.compile(r'Destination:\s+(.+)')
+        # aria2 announces the saved path as "Download complete: <path>" (notice
+        # level) or in the summary table as "OK  |  ... | <path>".
+        file_pattern = re.compile(r'(?:Download complete:|Destination:)\s+(\S.*)|^\S+\|OK\s*\|.*\|\s*(/\S.*)$')
         last_lines = []
 
         for line in iter(process.stdout.readline, ''):
@@ -945,7 +1018,7 @@ def aria2_worker(task_id, target_url, dest_dir, custom_filename, token, is_start
                 last_lines.pop(0)
             file_match = file_pattern.search(line)
             if file_match:
-                fname = os.path.basename(file_match.group(1).strip())
+                fname = os.path.basename((file_match.group(1) or file_match.group(2)).strip())
                 download_tasks[task_id]["file"] = fname
                 if not download_tasks[task_id]["title"]:
                     download_tasks[task_id]["title"] = fname
@@ -969,6 +1042,18 @@ def aria2_worker(task_id, target_url, dest_dir, custom_filename, token, is_start
             final_sz = 0
             resolved_fname = download_tasks[task_id].get("file", "model")
             resolved_file_path = os.path.join(dest_dir, resolved_fname)
+            if not os.path.isfile(resolved_file_path):
+                # Fall back to the newest finished file aria2 wrote in this folder.
+                recent = [
+                    f for f in os.listdir(dest_dir)
+                    if os.path.isfile(os.path.join(dest_dir, f))
+                    and not f.endswith((".aria2", ".crdownload", ".tmp", ".part"))
+                    and os.path.getmtime(os.path.join(dest_dir, f)) >= started_at - 5
+                ]
+                if recent:
+                    resolved_fname = max(recent, key=lambda f: os.path.getmtime(os.path.join(dest_dir, f)))
+                    resolved_file_path = os.path.join(dest_dir, resolved_fname)
+                    download_tasks[task_id]["file"] = resolved_fname
             if os.path.exists(resolved_file_path):
                 final_sz = os.path.getsize(resolved_file_path)
 
@@ -1112,13 +1197,14 @@ class ManagerHandler(BaseHTTPRequestHandler):
         elif url.path == "/api/health":
             self._send_json({"ok": True, "service": "comfy-xtra", "time": int(time.time())})
         elif url.path == "/api/settings":
-            self._send_json(get_all_settings())
+            self._send_json(masked_settings())
         elif url.path == "/api/groups":
             self._send_json(get_all_groups())
         elif url.path == "/api/favorites":
             self._send_json(get_all_favorites())
         elif url.path == "/api/tasks":
-            self._send_json(download_tasks)
+            # Copy first: download threads mutate these dicts while we serialise.
+            self._send_json({tid: dict(task) for tid, task in list(download_tasks.items())})
         elif url.path == "/api/probe":
             query = urllib.parse.parse_qs(url.query)
             target = query.get("url", [""])[0].strip()
@@ -1154,7 +1240,12 @@ class ManagerHandler(BaseHTTPRequestHandler):
             return
 
         if url.path == "/api/settings":
-            save_settings(payload)
+            # Masked values come back unchanged from the form: keep the stored secret.
+            updates = {
+                k: v.strip() for k, v in payload.items()
+                if k in SETTINGS_KEYS and isinstance(v, str) and not v.startswith(SECRET_MASK)
+            }
+            save_settings(updates)
             self._send_json({"ok": True})
         elif url.path == "/api/groups":
             gid = save_group(payload)
@@ -2608,39 +2699,170 @@ PY_EOF
 
 "$PYTHON_BIN" -m py_compile /opt/x-dashboard.py
 
-cat <<'SUP_EOF' > /usr/local/bin/comfy-xtra-supervisor.sh
+# ---------------------------------------------------------------------------
+# Optional speed boost (all off by default; set these in the template env):
+#   SAGE_ATTENTION=1  install SageAttention 1 (Triton kernels, quick pip install)
+#   SAGE_ATTENTION=2  build SageAttention 2 from source (faster kernels, 5-15 min
+#                     build, needs nvcc); falls back to SageAttention 1 on failure
+#   COMFY_FAST=1      add ComfyUI's --fast (fp16 accumulation / fp8 matmul on
+#                     GPUs that support it)
+# A flag is only added after its GPU smoke test passes, so a failed install
+# never stops ComfyUI from starting. Flags are written to ${WORKSPACE}/.env,
+# which the image's ComfyUI launcher sources after /etc/environment.
+# ---------------------------------------------------------------------------
+COMFY_PY=/venv/main/bin/python
+COMFY_DOTENV="${WORKSPACE:-/workspace}/.env"
+BOOST_SUMMARY="off"
+
+sage_smoke_test(){
+  "$COMFY_PY" - <<'PYSAGE'
+import torch
+from sageattention import sageattn
+q = torch.randn(1, 8, 256, 64, dtype=torch.float16, device="cuda")
+out = sageattn(q, q, q, tensor_layout="HND", is_causal=False)
+torch.cuda.synchronize()
+assert out.shape == q.shape and torch.isfinite(out).all()
+print("SageAttention smoke test passed")
+PYSAGE
+}
+
+install_sage(){
+  local want="$1" have
+  # Recent vastai/comfy images already ship SageAttention 1.x; SAGE_ATTENTION=2 upgrades it.
+  have="$("$COMFY_PY" -c 'from importlib.metadata import version; print(version("sageattention"))' 2>/dev/null || true)"
+  if [[ "$want" != 2 || "$have" == 2* ]] && sage_smoke_test; then
+    log "SageAttention ${have:-?} already installed and working"; return 0
+  fi
+  if [[ "$want" == 2 ]]; then
+    local nvcc_dir=""
+    if command -v nvcc >/dev/null 2>&1; then nvcc_dir="$(dirname "$(command -v nvcc)")"
+    elif [[ -x /usr/local/cuda/bin/nvcc ]]; then nvcc_dir=/usr/local/cuda/bin
+    fi
+    if [[ -n "$nvcc_dir" ]]; then
+      local arch jobs nv_inc nv_lib
+      arch="$("$COMFY_PY" -c 'import torch; m, n = torch.cuda.get_device_capability(); print(f"{m}.{n}")')"
+      jobs="$(nproc)"; (( jobs > 8 )) && jobs=8
+      # The image ships nvcc but not the full CUDA dev headers (e.g. cusparse.h);
+      # torch's pip-installed nvidia/* packages carry them, so add those paths.
+      nv_inc="$("$COMFY_PY" -c 'import glob, os, site; print(":".join(sorted(glob.glob(os.path.join(site.getsitepackages()[0], "nvidia", "*", "include")))))' 2>/dev/null || true)"
+      nv_lib="$("$COMFY_PY" -c 'import glob, os, site; print(":".join(sorted(glob.glob(os.path.join(site.getsitepackages()[0], "nvidia", "*", "lib")))))' 2>/dev/null || true)"
+      log "Building SageAttention 2 for compute ${arch} with ${jobs} jobs (can take 5-15 minutes)"
+      if PATH="$nvcc_dir:$PATH" TORCH_CUDA_ARCH_LIST="$arch" MAX_JOBS="$jobs" \
+           CPATH="${nv_inc}${CPATH:+:$CPATH}" LIBRARY_PATH="${nv_lib}${LIBRARY_PATH:+:$LIBRARY_PATH}" \
+           timeout 2400 "$COMFY_PY" -m pip install --no-cache-dir --no-build-isolation --no-deps \
+           "git+https://github.com/thu-ml/SageAttention.git" && sage_smoke_test; then
+        return 0
+      fi
+      log "WARN: SageAttention 2 build failed; falling back to SageAttention 1"
+    else
+      log "WARN: nvcc not found; cannot build SageAttention 2, falling back to SageAttention 1"
+    fi
+  fi
+  "$COMFY_PY" -m pip install --no-cache-dir --no-deps "sageattention==1.0.6" && sage_smoke_test
+}
+
+boost_flags=()
+if [[ "${SAGE_ATTENTION:-0}" =~ ^[12]$ ]]; then
+  if [[ ! -x "$COMFY_PY" ]]; then
+    log "WARN: SAGE_ATTENTION set but $COMFY_PY is missing; skipping"
+  elif install_sage "$SAGE_ATTENTION"; then
+    boost_flags+=(--use-sage-attention)
+  else
+    log "WARN: SageAttention unavailable; ComfyUI keeps its default attention"
+    send_discord "⚠️ Speed Boost Skipped" "SageAttention failed to install or failed its GPU test. ComfyUI will start without it." 15105570
+  fi
+fi
+if [[ "${COMFY_FAST:-0}" == 1 ]]; then boost_flags+=(--fast); fi
+
+if (( ${#boost_flags[@]} )); then
+  comfy_args=" ${COMFYUI_ARGS:---disable-auto-launch --port 18188 --enable-cors-header} "
+  for flag in "${boost_flags[@]}"; do
+    # Attention backends are mutually exclusive in ComfyUI's argparser.
+    if [[ "$flag" == --use-sage-attention ]]; then
+      for other in --use-pytorch-cross-attention --use-split-cross-attention --use-quad-cross-attention --use-flash-attention; do
+        comfy_args="${comfy_args// $other / }"
+      done
+    fi
+    [[ "$comfy_args" == *" $flag "* ]] || comfy_args+="$flag "
+  done
+  read -r -a comfy_words <<< "$comfy_args"
+  comfy_args="${comfy_words[*]}"
+  touch "$COMFY_DOTENV"
+  sed -i '/# comfy-xtra-boost$/d' "$COMFY_DOTENV"
+  printf 'COMFYUI_ARGS=%q # comfy-xtra-boost\n' "$comfy_args" >> "$COMFY_DOTENV"
+  BOOST_SUMMARY="${boost_flags[*]}"
+  log "Speed boost enabled: $BOOST_SUMMARY (COMFYUI_ARGS=$comfy_args)"
+  # ComfyUI normally waits for provisioning to finish; restart it if it is already up.
+  if command -v supervisorctl >/dev/null 2>&1 && [[ ! -f /.provisioning ]]; then
+    supervisorctl restart comfyui >/dev/null 2>&1 || true
+  fi
+elif [[ -f "$COMFY_DOTENV" ]]; then
+  sed -i '/# comfy-xtra-boost$/d' "$COMFY_DOTENV"
+fi
+
+# ---------------------------------------------------------------------------
+# Dashboard service. Vast only runs PROVISIONING_SCRIPT on first boot, so the
+# dashboard is registered with the image's supervisord: it restarts on crash
+# and comes back after an instance stop/start.
+# ---------------------------------------------------------------------------
+mkdir -p /opt/supervisor-scripts /etc/supervisor/conf.d
+cat <<'SUP_EOF' > /opt/supervisor-scripts/comfy-xtra.sh
 #!/bin/bash
-set -u
+utils=/opt/supervisor-scripts/utils
+[[ -f "${utils}/environment.sh" ]] && . "${utils}/environment.sh"
 ENV_FILE=/workspace/.comfy_xtra.env
-LOG=/var/log/comfy-xtra.log
-[[ -f "$ENV_FILE" ]] && source "$ENV_FILE"
+[[ -f "$ENV_FILE" ]] && . "$ENV_FILE"
 if [[ -x /venv/main/bin/python ]]; then PY=/venv/main/bin/python
 elif [[ -x /opt/conda/bin/python ]]; then PY=/opt/conda/bin/python
 else PY="$(command -v python3)"
 fi
-backoff=2
-while true; do
-  printf '%s starting dashboard\n' "$(date -Is)" >>"$LOG"
-  "$PY" /opt/x-dashboard.py >>"$LOG" 2>&1
-  rc=$?
-  printf '%s dashboard exited rc=%s; restarting in %ss\n' "$(date -Is)" "$rc" "$backoff" >>"$LOG"
-  sleep "$backoff"
-  (( backoff < 60 )) && backoff=$((backoff*2))
-done
-SUP_EOF
-chmod 700 /usr/local/bin/comfy-xtra-supervisor.sh
-
-# Replace prior supervisor/dashboard cleanly.
-pkill -f '/usr/local/bin/comfy-xtra-supervisor.sh' >/dev/null 2>&1 || true
+# Free the port if a copy launched outside supervisord still holds it.
 fuser -k 17890/tcp >/dev/null 2>&1 || true
-nohup /usr/local/bin/comfy-xtra-supervisor.sh </dev/null >/dev/null 2>&1 &
-SUP_PID=$!
+exec > >(tee -a /var/log/comfy-xtra.log) 2>&1
+exec "$PY" -u /opt/x-dashboard.py
+SUP_EOF
+chmod 755 /opt/supervisor-scripts/comfy-xtra.sh
+
+cat <<'CONF_EOF' > /etc/supervisor/conf.d/comfy-xtra.conf
+[program:comfy-xtra]
+environment=PROC_NAME="%(program_name)s"
+command=/opt/supervisor-scripts/comfy-xtra.sh
+autostart=true
+autorestart=true
+startsecs=5
+startretries=10
+stopasgroup=true
+killasgroup=true
+stopsignal=TERM
+stopwaitsecs=10
+stdout_logfile=/dev/stdout
+redirect_stderr=true
+stdout_events_enabled=true
+stdout_logfile_maxbytes=0
+stdout_logfile_backups=0
+CONF_EOF
+
+# Remove the nohup restart loop used by earlier versions of this script.
+pkill -f '/usr/local/bin/comfy-xtra-supervisor.sh' >/dev/null 2>&1 || true
+rm -f /usr/local/bin/comfy-xtra-supervisor.sh
+
+USE_SUPERVISOR=0
+if command -v supervisorctl >/dev/null 2>&1 && supervisorctl pid >/dev/null 2>&1; then
+  USE_SUPERVISOR=1
+  supervisorctl reread >/dev/null || true
+  supervisorctl update >/dev/null || true
+  supervisorctl restart comfy-xtra >/dev/null 2>&1 || true
+else
+  log "WARN: supervisord not reachable; starting dashboard without auto-restart"
+  fuser -k 17890/tcp >/dev/null 2>&1 || true
+  nohup /opt/supervisor-scripts/comfy-xtra.sh </dev/null >/dev/null 2>&1 &
+fi
 
 # Do not report success until the service is actually accepting requests.
 ready=0
 for _ in $(seq 1 90); do
   if curl -fsS --connect-timeout 2 http://127.0.0.1:17890/api/health >/dev/null 2>&1; then ready=1; break; fi
-  if ! kill -0 "$SUP_PID" >/dev/null 2>&1; then break; fi
+  if (( USE_SUPERVISOR )) && supervisorctl status comfy-xtra 2>/dev/null | grep -q FATAL; then break; fi
   sleep 2
 done
 
@@ -2652,7 +2874,7 @@ if [[ "$ready" != 1 ]]; then
 fi
 
 log "Comfy-Xtra ready on port 17890 (authentication disabled)"
-send_discord "🚀 Comfy-Xtra Online" "Dashboard passed health check on port `17890`." 238636
+send_discord "🚀 Comfy-Xtra Online" "Dashboard passed health check on port \`17890\`. Speed boost: ${BOOST_SUMMARY}." 2328118
 exit 0
 PROV_EOF
 
