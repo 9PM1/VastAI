@@ -51,6 +51,7 @@ jobs:
       - name: Run API tests
         env:
           BASE: http://127.0.0.1:17891
+          CIVITAI_TOKEN: ${{ secrets.CIVITAI_TOKEN }}
         run: python tests/api_test.py "$RUNNER_TEMP/ws"
       - name: Server log
         if: always()

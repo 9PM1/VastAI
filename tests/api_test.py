@@ -16,6 +16,8 @@ from PIL import Image, PngImagePlugin
 B = os.environ.get("BASE", "http://127.0.0.1:17891")
 WS = sys.argv[1]  # XTRA_WORKSPACE of the server, for creating gallery files
 results = []
+# Civitai refuses anonymous downloads from datacenter IPs (CI runners); with a token they work.
+CIVITAI_TOKEN = os.environ.get("CIVITAI_TOKEN", "")
 
 
 def check(name, cond, detail=""):
@@ -38,7 +40,7 @@ s, d = j("PUT", "/api/settings", json={"civitai_token": "abcdefghijklmnop1234", 
 check("settings masked", s == 200 and d["civitai_token"] == "••••1234" and d["concurrency"] == 2, d)
 s, d = j("PUT", "/api/settings", json={"civitai_token": "••••1234"})
 check("masked value not saved back", s == 200 and d["civitai_token"] == "••••1234", d)
-j("PUT", "/api/settings", json={"civitai_token": ""})
+j("PUT", "/api/settings", json={"civitai_token": CIVITAI_TOKEN})
 
 # resolve
 s, civ = j("GET", "/api/resolve", params={"url": "https://civitai.com/models/7808?modelVersionId=9208"})
@@ -90,11 +92,15 @@ while time.time() < deadline:
     time.sleep(2)
 for t in tasks:
     print("   task:", t["filename"], t["status"], t["error"] or "", t["size"])
-check("downloads finished", all(t["status"] == "done" for t in tasks), [(t["filename"], t["status"], t["error"]) for t in tasks])
+civ_blocked = not CIVITAI_TOKEN and any(t["filename"] == civ["filename"] and "Access denied" in (t["error"] or "") for t in tasks)
+if civ_blocked:
+    print("SKIP Civitai download checks: anonymous download refused (set CIVITAI_TOKEN)")
+check("downloads finished", all(t["status"] == "done" or (civ_blocked and t["filename"] == civ["filename"]) for t in tasks),
+      [(t["filename"], t["status"], t["error"]) for t in tasks])
 s, mods = j("GET", "/api/models")
-check("models scan sees files", any(f["name"] == "taesd_test.safetensors" for f in mods["vae"]) and mods["embeddings"], {k: v for k, v in mods.items() if v})
+check("models scan sees files", any(f["name"] == "taesd_test.safetensors" for f in mods["vae"]) and (civ_blocked or mods["embeddings"]), {k: v for k, v in mods.items() if v})
 s, lib = j("GET", "/api/library")
-check("library shows installed", any(i["id"] == item["id"] and i["installed"] for i in lib), lib)
+check("library shows installed", civ_blocked or any(i["id"] == item["id"] and i["installed"] for i in lib), lib)
 s, d = j("POST", "/api/downloads", json={"candidate": hf, "category": "vae", "filename": "taesd_test.safetensors"})
 check("re-download of installed file is a no-op", s == 200 and d["status"] == "done" and d["error"] == "Already installed", d)
 
@@ -120,7 +126,7 @@ by = {m["filename"]: m for m in a.get("models", [])}
 check("workflow: missing checkpoint", by.get("sdxl_missing.safetensors", {}).get("status") == "missing" and by["sdxl_missing.safetensors"]["category"] == "checkpoints", a)
 check("workflow: embedded url", by.get("ae.safetensors", {}).get("status") == "has_url", a)
 check("workflow: wrong folder detected", by.get("taesd_renamed.safetensors", {}).get("status") == "wrong_folder", a)
-check("workflow: embedding installed", by.get(emb, {}).get("status") == "installed", a)
+check("workflow: embedding installed", by.get(emb, {}).get("status") == ("in_library" if civ_blocked else "installed"), a)
 api_wf = {"3": {"class_type": "UNETLoader", "inputs": {"unet_name": "krea2.safetensors", "weight_dtype": "default"}}}
 s, a2 = j("POST", "/api/workflows/analyze", json=api_wf)
 check("workflow: API format", s == 200 and a2["models"][0]["category"] == "diffusion_models", a2)

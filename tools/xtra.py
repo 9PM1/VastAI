@@ -178,23 +178,34 @@ def cmd_rent(a):
             extra = ["--link-volume", str(vol["id"]), "--mount-path", VOLUME_MOUNT]
         env["XTRA_MODEL_VOLUME"] = VOLUME_MOUNT
     offers = search_offers(a.gpu, a.max_price, a.min_vram, machine)
+    vol_offer = None
+    if a.keep_models and not machine:
+        # A new local volume must be created on the same machine as the instance.
+        vol_offers = {v["machine_id"]: v for v in vast("search", "volumes", f"disk_space>={a.volume_size}", check=False) or []}
+        offers = [o for o in offers if o["machine_id"] in vol_offers]
     if not offers:
-        die("no offer matches (try another --gpu or a higher --max-price" + (", or the volume's machine is busy" if machine else "") + ")")
+        die("no offer matches (try another --gpu or a higher --max-price" +
+            (", or the volume's machine is busy" if machine else ", or drop --keep-models: few machines offer volumes" if a.keep_models else "") + ")")
     o = offers[0]
     if a.keep_models and not machine:
-        vols = vast("search", "volumes", f"machine_id={o['machine_id']}", check=False) or []
-        if not vols:
-            die(f"machine {o['machine_id']} doesn't offer volumes; drop --keep-models or pick another --gpu")
-        extra = ["--create-volume", str(vols[0]["id"]), "--volume-size", str(a.volume_size), "--mount-path", VOLUME_MOUNT, "--volume-label", VOLUME_LABEL]
+        vol_offer = vol_offers[o["machine_id"]]
+        extra = ["--create-volume", str(vol_offer["id"]), "--volume-size", str(a.volume_size), "--mount-path", VOLUME_MOUNT,
+                 "--volume-label", VOLUME_LABEL]
     print(f"Best offer: {o['gpu_name']} {o['gpu_ram'] / 1024:.0f} GB, {money(o['dph_total'])}, {o['inet_down'] / 1000:.1f} Gbps, "
           f"disk {o['disk_bw'] / 1000:.1f} GB/s, {o['cpu_ram'] / 1024:.0f} GB RAM, {o.get('geolocation')}  (offer {o['id']})")
-    if not a.yes:
-        if input("Rent it? [y/N] ").strip().lower() != "y":
-            die("cancelled", 0)
+    if vol_offer:
+        print(f"New {a.volume_size} GB models volume on that machine: about ${vol_offer['storage_cost'] * a.volume_size:.2f}/month, "
+              "kept (and billed) until you delete it with `vastai delete volume ID`.")
     env_args = " ".join(f"-e {k}={v}" for k, v in env.items())
     args = ["create", "instance", str(o["id"]), "--template_hash", t["hash_id"], "--disk", str(a.disk), "--label", a.label] + extra
     if env_args:
         args += ["--env", env_args]
+    if a.dry_run:
+        print("Would run: vastai " + " ".join(args))
+        return
+    if not a.yes:
+        if input("Rent it? [y/N] ").strip().lower() != "y":
+            die("cancelled", 0)
     r = vast(*args)
     iid = (r or {}).get("new_contract") or die(f"rent failed: {r}")
     print(f"Rented instance {iid}. Waiting for it to boot and provision (about 1-3 minutes)…")
@@ -320,7 +331,8 @@ def main():
     p.add_argument("--keep-models", action="store_true", help=f"store models on a Vast volume ({VOLUME_LABEL}) that outlives the instance")
     p.add_argument("--volume-size", type=int, default=150); p.add_argument("--label", default="comfy-xtra")
     p.add_argument("--set", action="append", metavar="KEY=VALUE", help="extra env var for this instance (merged over the template's)")
-    p.add_argument("--yes", "-y", action="store_true"); p.set_defaults(fn=cmd_rent)
+    p.add_argument("--yes", "-y", action="store_true"); p.add_argument("--dry-run", action="store_true", help="show the choice, rent nothing")
+    p.set_defaults(fn=cmd_rent)
     p = sub.add_parser("status", help="instances and their dashboard / host health")
     p.add_argument("id", nargs="?"); p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_status)
     p = sub.add_parser("tunnel", help="open the dashboard and ComfyUI on localhost")
