@@ -23,8 +23,9 @@ https://raw.githubusercontent.com/9PM1/VastAI/refs/heads/main/provis.sh
 | `lib/sage.sh` | SageAttention install helpers: prebuilt wheel from this repo's releases, else source build. |
 | `lib/tune.py` | Benchmarks every attention backend on the GPU, checks accuracy, picks the fastest and the `--fast` features the GPU supports. Cached in `/workspace/.comfy_xtra/tune.json`. |
 | `tools/build-sage-wheel.sh` | Builds the multi-GPU SageAttention wheel published as a release. |
-| `dashboard/server.py` | Dashboard API (Python standard library + pymongo). |
-| `dashboard/index.html` | Dashboard UI. Read on every request, so edits apply without a restart. |
+| `dashboard/server.py` | Dashboard entry point (aiohttp, runs in ComfyUI's venv; binds 127.0.0.1:17890 behind the portal). |
+| `dashboard/xtra/` | Backend: `store` (SQLite + background MongoDB sync, v1 migration), `sources` (Civitai / Hugging Face), `downloads` (aria2 queue with resume + SHA-256 checks), `models`, `workflows` (missing-model finder), `system` (GPU / queue / Vast cost monitor), `gallery`, `api` (routes), `events` (live updates over SSE). |
+| `dashboard/web/` | Built web UI, served at `/` (falls back to a placeholder page when absent). |
 | `supervisor/` | supervisord program definition and launcher. |
 
 ## Template environment variables
