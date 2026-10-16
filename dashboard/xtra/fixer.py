@@ -756,6 +756,17 @@ def plan(workflow, library, settings, reported_missing_nodes=None):
     need = sum(e["fix"]["size"] for e in auto if e["fix"]["kind"] == "download")
     free = shutil.disk_usage(config.WORKSPACE).free if config.WORKSPACE.exists() else None
     unresolved = [e["filename"] for e in out_models if e["status"] != "installed" and not e["fix"] and not e.get("optional")]
+
+    def size_of(e):
+        """What fixing this model would download: its fix, else the top suggestion's file (None if unknown)."""
+        if e["fix"] and e["fix"]["kind"] == "download":
+            return e["fix"]["size"] or None
+        if e["fix"]:
+            return 0  # a move
+        return (e.get("possible") or [{}])[0].get("size") or None
+    missing = [e for e in out_models if e["status"] != "installed"]
+    sizes = {id(e): size_of(e) for e in missing}
+    size_min = sum(sizes[id(e)] or 0 for e in missing if not e.get("optional"))
     return {
         "models": out_models,
         "nodes": nodes,
@@ -766,6 +777,10 @@ def plan(workflow, library, settings, reported_missing_nodes=None):
             "nodes_missing": len(nodes),
             "nodes_fixable": sum(1 for n in nodes if n["pack"] and n["pack"]["state"] not in ("enabled", "installed")),
             "download_bytes": need,
+            # Everything to run the workflow as it's set up (picks included), and with its switched-off nodes too.
+            "size_min": size_min,
+            "size_max": size_min + sum(sizes[id(e)] or 0 for e in missing if e.get("optional")),
+            "size_unknown": sum(1 for e in missing if sizes[id(e)] is None),
             "disk_free": free,
             "unresolved": unresolved,
             "nodes_error": nodes_error,
