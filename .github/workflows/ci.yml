@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "feature/**", "rewrite/**"]
+  pull_request:
+
+jobs:
+  ui:
+    name: Build dashboard UI
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dashboard/ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: dashboard/ui/package-lock.json
+      - run: npm ci
+      - run: npm run build
+
+  api:
+    name: API tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q && sudo apt-get install -yq aria2
+          pip install "aiohttp>=3.11" psutil pillow requests huggingface_hub "pymongo[srv]" certifi av
+      - name: Lint shell and Python
+        run: |
+          for f in provis.sh lib/*.sh; do bash -n "$f"; done
+          python -m py_compile tools/xtra.py lib/tune.py comfyui_ext/__init__.py dashboard/server.py dashboard/xtra/*.py
+      - name: Start the dashboard
+        env:
+          XTRA_WORKSPACE: ${{ runner.temp }}/ws
+          XTRA_PORT: "17891"
+          COMFYUI_API_BASE: http://127.0.0.1:1
+        run: |
+          mkdir -p "$XTRA_WORKSPACE"
+          nohup python -u dashboard/server.py > "$RUNNER_TEMP/server.log" 2>&1 &
+          for i in $(seq 30); do curl -fs http://127.0.0.1:17891/api/health && exit 0; sleep 1; done
+          cat "$RUNNER_TEMP/server.log"; exit 1
+      - name: Run API tests
+        env:
+          BASE: http://127.0.0.1:17891
+        run: python tests/api_test.py "$RUNNER_TEMP/ws"
+      - name: Server log
+        if: always()
+        run: cat "$RUNNER_TEMP/server.log"
