@@ -1,0 +1,2 @@
+# Everything runs on Linux: keep LF line endings even when edited on Windows.
+* text=auto eol=lf
