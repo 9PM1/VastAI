@@ -114,7 +114,14 @@ async def monitor_loop(interval=2.0):
 
 
 async def comfy_ws_loop():
-    """Relay ComfyUI's websocket (queue size, progress, errors) to the browser."""
+    """Relay ComfyUI's websocket (queue size, progress, errors) to the browser.
+
+    ComfyUI sends execution_start / executed / execution_success only to the
+    browser tab that queued the prompt. Every other client (us) gets "status"
+    (queue size, including the running prompt), "progress" and "progress_state".
+    So progress marks a job as running, and a shrinking queue means a job
+    finished and probably wrote outputs.
+    """
     url = config.COMFY_URL.replace("http", "ws", 1) + "/ws?clientId=comfy-xtra-monitor"
     while True:
         try:
@@ -127,13 +134,22 @@ async def comfy_ws_loop():
                     ev = json.loads(msg.data)
                     kind, data = ev.get("type"), ev.get("data") or {}
                     if kind == "status":
-                        _comfy_state["queue_remaining"] = ((data.get("status") or {}).get("exec_info") or {}).get("queue_remaining", 0)
+                        queue = ((data.get("status") or {}).get("exec_info") or {}).get("queue_remaining", 0)
+                        if queue < _comfy_state["queue_remaining"]:
+                            bus.publish("outputs", {})  # a prompt finished
+                        _comfy_state["queue_remaining"] = queue
+                        if queue == 0:
+                            _comfy_state.update(running=None, progress=None)
                     elif kind == "execution_start":
                         _comfy_state.update(running=data.get("prompt_id"), progress=None, last_error=None)
-                    elif kind == "progress":
-                        _comfy_state["progress"] = {"value": data.get("value"), "max": data.get("max"), "node": data.get("node")}
+                    elif kind in ("progress", "progress_state"):
+                        _comfy_state["running"] = data.get("prompt_id") or _comfy_state["running"] or "running"
+                        if kind == "progress":
+                            _comfy_state["progress"] = {"value": data.get("value"), "max": data.get("max"), "node": data.get("node")}
                         bus.publish("comfy", dict(_comfy_state), throttle_key="comfy-progress", min_interval=0.25)
                         continue
+                    elif kind == "executing" and data.get("node") is None:
+                        _comfy_state.update(running=None, progress=None)
                     elif kind in ("execution_success", "execution_interrupted"):
                         _comfy_state.update(running=None, progress=None)
                     elif kind == "execution_error":

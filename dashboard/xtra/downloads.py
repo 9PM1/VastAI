@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import time
+import urllib.parse
 
 import aiohttp
 
@@ -165,11 +166,11 @@ class DownloadManager:
             task.update(status="starting", error="", started_at=task["started_at"] or now())
             self._emit(task)
             try:
-                headers = self._auth_headers(task)
+                url, headers = await self._resolve(task["url"], self._auth_headers(task))
                 if self.aria2:
-                    await self._aria2(task, staging, headers)
+                    await self._aria2(task, staging, headers, url)
                 else:
-                    await self._http(task, part, headers)
+                    await self._http(task, part, headers, url)
                 await self._verify(task, part)
                 if task["status"] == "cancelled":
                     raise Cancelled()
@@ -206,9 +207,37 @@ class DownloadManager:
             token = ""
         return {"Authorization": f"Bearer {token.strip()}"} if token else {}
 
-    async def _aria2(self, task, staging, headers):
+    async def _resolve(self, url, headers):
+        """Follow redirects ourselves when a token is involved.
+
+        Civitai and Hugging Face redirect downloads to signed storage URLs. aria2
+        re-sends custom headers on every hop, and storage hosts reject a request
+        carrying both a signed URL and an Authorization header (HTTP 403). So the
+        token goes only to the original host, and aria2 gets the final signed URL
+        (with the token only if the file is served from that same host).
+        """
+        if not headers:
+            return url, {}
+        origin = urllib.parse.urlparse(url).netloc
+        cur = url
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": "Comfy-Xtra/2"}) as s:
+            for _ in range(8):
+                same = urllib.parse.urlparse(cur).netloc == origin
+                async with s.get(cur, headers=headers if same else {}, allow_redirects=False) as r:
+                    if r.status in (301, 302, 303, 307, 308) and r.headers.get("Location"):
+                        cur = urllib.parse.urljoin(cur, r.headers["Location"])
+                        continue
+                    if r.status in (401, 403):
+                        raise PermissionError(f"Access denied (HTTP {r.status}). Add or check your API token in Settings; some models also need their licence accepted on the website.")
+                    r.raise_for_status()
+                    break
+        same = urllib.parse.urlparse(cur).netloc == origin
+        return cur, headers if same else {}
+
+    async def _aria2(self, task, staging, headers, url):
         # Options go through stdin (--input-file=-) so tokens never appear in `ps`.
-        spec = [task["url"], f"  dir={staging}", f"  out={task['filename']}"]
+        spec = [url, f"  dir={staging}", f"  out={task['filename']}"]
         spec += [f"  header={k}: {v}" for k, v in headers.items()]
         cmd = [self.aria2, "--input-file=-", "-x", "16", "-s", "16", "-k", "1M", "--continue=true",
                "--auto-file-renaming=false", "--allow-overwrite=true", "--file-allocation=none",
@@ -256,12 +285,12 @@ class DownloadManager:
                 raise PermissionError(f"Access denied ({detail}). Add or check your API token in Settings; some models also need their licence accepted on the website.")
             raise RuntimeError(detail)
 
-    async def _http(self, task, part, headers):
+    async def _http(self, task, part, headers, url):
         start = part.stat().st_size if part.exists() else 0
         req_headers = dict(headers, **({"Range": f"bytes={start}-"} if start else {}))
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=60)
         async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": "Comfy-Xtra/2"}) as s:
-            async with s.get(task["url"], headers=req_headers) as r:
+            async with s.get(url, headers=req_headers) as r:
                 if r.status in (401, 403):
                     raise PermissionError(f"Access denied (HTTP {r.status}). Add or check your API token in Settings.")
                 r.raise_for_status()

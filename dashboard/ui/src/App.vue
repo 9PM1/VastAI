@@ -4,19 +4,22 @@ import { BookMarked, Compass, Workflow, Download, Images, Activity, Settings, Za
 import { useApp } from './stores/app'
 import { route, go } from './lib/route'
 import StatusBar from './components/StatusBar.vue'
+import ViewState from './components/ViewState.vue'
 import Toasts from './components/ui/Toasts.vue'
 
 const app = useApp()
 onMounted(() => app.init())
 
+// Each screen is its own chunk; show a spinner while it loads and a reload prompt if it can't.
+const lazy = (loader) => defineAsyncComponent({ loader, loadingComponent: ViewState, errorComponent: ViewState, delay: 150, timeout: 30000 })
 const views = {
-  library: defineAsyncComponent(() => import('./views/LibraryView.vue')),
-  discover: defineAsyncComponent(() => import('./views/DiscoverView.vue')),
-  workflows: defineAsyncComponent(() => import('./views/WorkflowsView.vue')),
-  downloads: defineAsyncComponent(() => import('./views/DownloadsView.vue')),
-  gallery: defineAsyncComponent(() => import('./views/GalleryView.vue')),
-  monitor: defineAsyncComponent(() => import('./views/MonitorView.vue')),
-  settings: defineAsyncComponent(() => import('./views/SettingsView.vue')),
+  library: lazy(() => import('./views/LibraryView.vue')),
+  discover: lazy(() => import('./views/DiscoverView.vue')),
+  workflows: lazy(() => import('./views/WorkflowsView.vue')),
+  downloads: lazy(() => import('./views/DownloadsView.vue')),
+  gallery: lazy(() => import('./views/GalleryView.vue')),
+  monitor: lazy(() => import('./views/MonitorView.vue')),
+  settings: lazy(() => import('./views/SettingsView.vue')),
 }
 const nav = computed(() => [
   { id: 'library', label: 'Library', icon: BookMarked },
@@ -65,6 +68,7 @@ const nav = computed(() => [
           </div>
         </div>
         <component :is="views[route.view]" v-else-if="app.ready" :key="route.view" />
+        <ViewState v-else />
       </main>
     </div>
 
