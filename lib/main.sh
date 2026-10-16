@@ -15,8 +15,10 @@ log "Python: $PYTHON_BIN"
 send_discord "⚙️ Provisioning Started" "Comfy-Xtra setup started on \`$(hostname)\`." 3447003
 
 . "$XTRA_DIR/lib/setup.sh"
-. "$XTRA_DIR/lib/boost.sh"
+# Start the dashboard first so auto-install favorites download while the
+# speed boost installs and benchmarks.
 . "$XTRA_DIR/lib/service.sh"
+. "$XTRA_DIR/lib/boost.sh"
 
 log "Comfy-Xtra ready on port ${DASH_PORT} (authentication disabled)"
 send_discord "🚀 Comfy-Xtra Online" "Dashboard passed health check on port \`${DASH_PORT}\`. Speed boost: ${BOOST_SUMMARY}." 2328118
