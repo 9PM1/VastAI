@@ -17,9 +17,9 @@ def node(t, *values):
     return {"type": t, "widgets_values": list(values)}
 
 
-def offer(oid, gpu, dlperf, dph, machine, mem_bw=1450, fee=0.003, ram=32768):
+def offer(oid, gpu, dlperf, dph, machine, mem_bw=1450, fee=0.003, ram=32768, up=0.004, power=None):
     return {"id": oid, "gpu_name": gpu, "dlperf": dlperf, "dph_total": dph, "machine_id": machine, "gpu_mem_bw": mem_bw,
-            "inet_down_cost": fee, "gpu_ram": ram, "reliability2": 0.99}
+            "inet_down_cost": fee, "inet_up_cost": up, "gpu_ram": ram, "reliability2": 0.99, "gpu_max_power": power}
 
 
 class WorkflowNeeds(unittest.TestCase):
@@ -114,6 +114,16 @@ class Ranking(unittest.TestCase):
         self.assertEqual(hidden["bandwidth"], 2)  # offer 2 charges $15.6/TB too
         ranked, _ = xtra.rank_offers([dict(o) for o in offers], [], max_download_per_tb=None)
         self.assertIn(6, [o["id"] for o in ranked])
+
+    def test_expensive_upload_hidden_and_power_cap_scales_speed(self):
+        offers = [offer(7, "RTX 5090", 200, 0.5, 17, up=0.05),                 # $50/TB upload
+                  offer(8, "RTX 5090", 200, 0.5, 18, power=600), offer(9, "RTX 5090", 200, 0.5, 19, power=400)]
+        ranked, hidden = xtra.rank_offers(offers, [])
+        by = {o["id"]: o for o in ranked}
+        self.assertNotIn(7, by)
+        self.assertEqual(hidden["bandwidth"], 1)
+        self.assertAlmostEqual(by[9]["_power"], 400 / 600, places=3)
+        self.assertAlmostEqual(by[9]["_ips"] / by[8]["_ips"], (400 / 600) ** xtra.POWER_EXPONENT, places=3)
 
     def test_bad_hosts_skipped(self):
         ranked, hidden = xtra.rank_offers([dict(o) for o in self.offers], [], bad={"11": {}})

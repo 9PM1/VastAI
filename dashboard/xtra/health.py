@@ -2,7 +2,10 @@
 
 Catches the usual reasons a big GPU feels slow on a marketplace host: VRAM used
 by something else, a host-capped power limit, thermal / power throttling, a
-narrow PCIe link, a slow disk, a slow network, or less RAM than VRAM.
+narrow PCIe link, a slow disk, a slow network, or less RAM than VRAM. A 30 s
+full-load probe catches hosts that are fast for a few seconds and then slow down:
+an RTX 5090 that tested at 160 TFLOPS for 10 s and 89 TFLOPS after (driver
+"Reliability" clock event) looked healthy to every idle check.
 Runs once after boot (results cached in DATA_DIR/health.json) and on demand.
 """
 import asyncio
@@ -31,6 +34,40 @@ print(json.dumps({"h2d": h2d, "torch_free": free, "torch_total": total}))
 """
 
 
+# Full load for ~30 s: fp16 matmuls, timed per second, with the driver's clock-event reasons sampled.
+SUSTAINED_PROBE = r"""
+import json, subprocess, threading, time, torch
+n = 8192
+a = torch.randn(n, n, device="cuda", dtype=torch.float16); b = torch.randn(n, n, device="cuda", dtype=torch.float16)
+for _ in range(5): a @ b
+torch.cuda.synchronize()
+reasons, power, stop = set(), [], threading.Event()
+def sample():
+    while not stop.is_set():
+        out = subprocess.run(["nvidia-smi", "--query-gpu=clocks_event_reasons.active,power.draw", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True).stdout.strip().split(",")
+        if len(out) == 2:
+            reasons.add(out[0].strip())
+            try: power.append(float(out[1]))
+            except ValueError: pass
+        time.sleep(1)
+threading.Thread(target=sample, daemon=True).start()
+rates, t0 = [], time.time()
+while time.time() - t0 < 30:
+    w = time.time()
+    for _ in range(20): a @ b
+    torch.cuda.synchronize()
+    rates.append(20 * 2 * n ** 3 / (time.time() - w) / 1e12)
+stop.set()
+k = max(1, len(rates) // 6)
+print(json.dumps({"burst": sum(rates[:k]) / k, "sustained": sum(rates[-len(rates) // 2:]) / (len(rates) - len(rates) // 2),
+                  "reasons": sorted(reasons), "power": sum(power) / len(power) if power else None}))
+"""
+# nvidia-smi clocks_event_reasons bits that mean "slowed down" (idle and app-clock settings don't).
+SLOWDOWN_BITS = {0x4: "power cap", 0x8: "hardware slowdown", 0x20: "thermal (software)", 0x40: "thermal (hardware)",
+                 0x80: "power brake", 0x400: "reliability limit"}
+
+
 async def _gpu_details():
     if not shutil.which("nvidia-smi"):
         return None
@@ -57,6 +94,25 @@ async def _pcie_probe():
         return json.loads(out.decode().strip().splitlines()[-1])
     except Exception as exc:
         log.info("PCIe probe failed: %s", exc)
+        return None
+
+
+async def _sustained_probe():
+    py = "/venv/main/bin/python" if os.path.exists("/venv/main/bin/python") else "python3"
+    proc = await asyncio.create_subprocess_exec(py, "-c", SUSTAINED_PROBE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), 120)
+        r = json.loads(out.decode().strip().splitlines()[-1])
+        bits = 0
+        for v in r["reasons"]:
+            try:
+                bits |= int(v, 16)
+            except ValueError:
+                pass
+        r["slowdowns"] = [name for bit, name in SLOWDOWN_BITS.items() if bits & bit]
+        return r
+    except Exception as exc:
+        log.info("Sustained GPU probe failed: %s", exc)
         return None
 
 
@@ -103,6 +159,9 @@ async def _download_speed():
 async def run():
     """Measure the host and return {checks, warnings, score}. Takes ~30-60 s."""
     gpu, pcie = await _gpu_details(), await _pcie_probe()
+    comfy = (await system.snapshot()).get("comfy") or {}
+    # Full load only while nothing is generating (it runs at boot, or when asked).
+    load = None if (comfy.get("running") or comfy.get("queue_remaining")) else await _sustained_probe()
     disk, net = await _disk_read_speed(), await _download_speed()
     snap = await system.snapshot()
     ram_total = snap["ram"]["total"]
@@ -140,6 +199,16 @@ async def run():
         if gpu["pcie_width"] and gpu["pcie_width_max"]:
             add("PCIe lanes", f"x{gpu['pcie_width']:.0f} of x{gpu['pcie_width_max']:.0f}", gpu["pcie_width"] >= gpu["pcie_width_max"] / 2,
                 "Lanes the slot gives the GPU", f"The GPU runs on x{gpu['pcie_width']:.0f} lanes: loading models into VRAM will be slow.")
+    severe = False
+    if load and load.get("burst"):
+        keep = load["sustained"] / load["burst"]
+        severe = keep < 0.65
+        why = [s for s in load["slowdowns"] if s != "power cap"] or load["slowdowns"]
+        add("Speed under load", f"{load['sustained']:.0f} TFLOPS ({keep:.0%} of burst)", keep >= 0.85,
+            f"fp16 matmul for 30 s: {load['burst']:.0f} TFLOPS in the first seconds, {load['sustained']:.0f} sustained"
+            + (f"; driver reports {', '.join(load['slowdowns'])}" if load["slowdowns"] else ""),
+            f"Under sustained load the GPU drops to {keep:.0%} of its starting speed"
+            + (f" (driver: {', '.join(why)})" if why else "") + ": long renders will run that much slower.")
     if pcie:
         gbs = pcie["h2d"] / 1e9
         add("Host → GPU copy", f"{gbs:.1f} GB/s", gbs >= 6, "Measured pinned-memory copy (PCIe 4 x16 ≈ 25 GB/s)",
@@ -155,7 +224,8 @@ async def run():
             "RAM should be at least 1.5× VRAM for offloading big models",
             f"Only {human_size(ram_total)} RAM for {human_size(gpu['vram_total'])} VRAM: big models may not fit in RAM when offloaded.")
     result = {"at": int(time.time()), "gpu": gpu and gpu["name"], "checks": checks, "warnings": warnings,
-              "score": "good" if not warnings else "poor" if len(warnings) >= 2 else "fair"}
+              "score": "good" if not warnings else "poor" if len(warnings) >= 2 or severe else "fair",
+              "load": load}
     RESULT_PATH.write_text(json.dumps(result))
     return result
 
