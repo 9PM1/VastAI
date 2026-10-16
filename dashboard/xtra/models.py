@@ -43,12 +43,15 @@ def _path(category, name):
     return model_path(category, name)
 
 
-def move(category, name, new_category):
-    src, dst = _path(category, name), _path(new_category, name)
+def move(category, name, new_category, new_name=None):
+    """Move a model to another folder, or into the sub-folder a workflow expects (new_name)."""
+    src = model_path(category, name, subdirs=True)
+    dst = model_path(new_category, new_name or os.path.basename(name), subdirs=True)
     if not src.is_file():
         raise FileNotFoundError(name)
     if dst.exists():
-        raise FileExistsError(f"{new_category}/{name} already exists")
+        raise FileExistsError(f"{new_category}/{new_name or name} already exists")
+    dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(src, dst)
 
 

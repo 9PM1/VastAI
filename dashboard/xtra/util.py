@@ -33,13 +33,17 @@ def safe_filename(name):
     return name
 
 
-def model_path(category, filename):
-    """Absolute path of a model file, guaranteed to stay inside its category folder."""
+def model_path(category, filename, subdirs=False):
+    """Absolute path of a model file, guaranteed to stay inside its category folder.
+    With subdirs, filename may name a sub-folder ('MiniMaxH3/model.safetensors'), as workflows do."""
     if category not in config.CATEGORY_NAMES:
         raise ValueError(f"Unknown category: {category!r}")
     base = (config.MODELS_DIR / category).resolve()
-    target = (base / safe_filename(filename)).resolve()
-    if target.parent != base:
+    parts = (filename or "").replace("\\", "/").split("/")
+    if (len(parts) > 1 and not subdirs) or len(parts) > 4:
+        raise ValueError(f"Unsafe filename: {filename!r}")
+    target = base.joinpath(*[safe_filename(p) for p in parts]).resolve()
+    if target == base or not target.is_relative_to(base) or (not subdirs and target.parent != base):
         raise ValueError("Path escapes the model folder")
     return target
 

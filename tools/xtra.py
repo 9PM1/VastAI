@@ -781,13 +781,22 @@ def cmd_fix(a):
         print(json.dumps(plan, indent=1))
         return
     s = plan["summary"]
-    print(f"{s['models_missing']} missing model(s) ({s['models_fixable']} fixable), {s['nodes_missing']} missing node type(s)")
-    for m in plan["models"]:
-        if m["status"] != "installed":
-            src = (m.get("origin") or "NOT FOUND") + (" (gated: accept licence + HF token)" if ((m.get("fix") or {}).get("candidate") or {}).get("gated") else "")
-            print(f"  model  {m['filename']:<48} {m['category'] or '?':<16} {src}")
+    print(f"{s['models_missing']} missing model(s) ({s['models_fixable']} fixable, {s['download_bytes'] / 1e9:.1f} GB), "
+          f"{s.get('models_optional', 0)} optional (switched-off nodes), {s['nodes_missing']} missing node type(s)")
+    for m in sorted(plan["models"], key=lambda m: bool(m.get("optional"))):
+        if m["status"] == "installed":
+            continue
+        cand = (m.get("fix") or {}).get("candidate") or {}
+        if m.get("fix"):
+            src = m.get("origin") or "?"
+        elif m.get("possible"):
+            src = f"pick one, e.g. {m['possible'][0]['name'][:40]}"
+        else:
+            src = "NOT FOUND"
+        src += " (gated: accept licence + HF token)" if cand.get("gated") else ""
+        print(f"  {'optional' if m.get('optional') else 'model   '} {m['name'][-60:]:<60} {m['category'] or '?':<21} {src}")
     for n in plan["nodes"]:
-        print(f"  node   {n['type']:<48} {(n['pack'] or {}).get('title') or 'no pack found'}")
+        print(f"  node     {n['type']:<60} {(n['pack'] or {}).get('title') or 'no pack found'}{' (linked in the notes)' if n.get('via_notes') else ''}")
     if s["models_fixable"] or s["nodes_fixable"]:
         print("Fix it from the ⚡ Xtra tab in ComfyUI, or the Fixer screen in Comfy-Xtra.")
 

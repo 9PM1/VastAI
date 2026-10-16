@@ -40,12 +40,13 @@ async def fix_apply(request):
         fix = m.get("fix") or {}
         try:
             if fix.get("kind") == "download":
+                # The plan already names the file as the workflow expects (sub-folder included).
                 cand = dict(fix["candidate"], category=m.get("category") or fix["candidate"].get("category"),
-                            filename=m.get("filename") or fix["candidate"].get("filename"))
+                            filename=fix["candidate"].get("filename") or m.get("name") or m.get("filename"))
                 tasks.append(_dl(request).add(cand))
             elif fix.get("kind") == "move":
                 from . import models
-                await asyncio.to_thread(models.move, fix["from"], m["filename"], fix["to"])
+                await asyncio.to_thread(models.move, fix["from"], fix.get("from_name") or m["filename"], fix["to"], fix.get("to_name"))
                 moves.append(m["filename"])
         except Exception as exc:
             errors.append({"filename": m.get("filename"), "error": str(exc)})
@@ -55,7 +56,7 @@ async def fix_apply(request):
     if moves:
         bus.publish("models", {})
     return ok({"tasks": tasks, "moves": moves, "packs": packs, "errors": errors,
-               "restart_needed": any(v == "queued" for v in packs.values())})
+               "restart_needed": any(v in ("queued", "installed") for v in packs.values())})
 
 
 @routes.post("/api/fix/use")

@@ -185,6 +185,24 @@ def _suggestion_from_candidate(c):
             "page_url": c.get("page_url") or "", "url": c.get("url")}
 
 
+def all_words(stem):
+    """Every descriptive word in a file name, base-model words included (for ranking suggestions)."""
+    s = re.sub(r"([a-z])([A-Z])", r"\1 \2", stem)
+    s = re.sub(r"([A-Za-z])(\d)", r"\1 \2", s)
+    return [w.lower() for w in re.split(r"[^A-Za-z0-9]+", s) if len(w) > 1 and not w.isdigit()
+            and w.lower() not in ("safetensors", "fp16", "bf16", "fp32", "fp8", "int", "the", "and", "of", "v")]
+
+
+def suggestion_score(filename, name, other_filename):
+    """How much a suggested model looks like the missing file: its words found in the suggestion's
+    name or file name, plus how similar the file names are."""
+    want = _norm_filename(filename)
+    hay = _norm_filename(other_filename) + re.sub(r"[^a-z0-9]", "", (name or "").lower())
+    words = [w for w in all_words(os.path.splitext(os.path.basename(filename))[0]) if len(w) >= 4]
+    overlap = sum(w in hay for w in words) / len(words) if words else 0
+    return round(0.6 * overlap + 0.4 * difflib.SequenceMatcher(None, _norm_filename(other_filename), want).ratio(), 3)
+
+
 def _civitai_suggestion(m, show_nsfw, v=None, f=None):
     v = v or (m.get("modelVersions") or [{}])[0]
     files = v.get("files") or []
@@ -216,6 +234,9 @@ def civitai_find(filename, category, settings):
     if len(long_words) >= 2:
         queries.append(" ".join(long_words[:2]))
     queries += long_words[:2]
+    first = all_words(stem)[:2]
+    if len(first) == 2:
+        queries.append(" ".join(first))  # e.g. "dasiwa minimax": the family words name the model
     params = {"limit": 100, "nsfw": "true"}
     if CATEGORY_TO_CIVITAI.get(category):
         params["types"] = CATEGORY_TO_CIVITAI[category]
@@ -250,11 +271,15 @@ def civitai_find(filename, category, settings):
                 return {"confidence": "exact", "candidate": sources.civitai_version(v["id"], token, f.get("id"), show_nsfw)}
             except Exception as exc:  # unpublished / early-access versions 404 on their own
                 log.info("Civitai version %s for %s unavailable: %s", v["id"], filename, exc)
-    # Nothing with this file name: offer the models whose names look most like the file's words.
-    phrase = " ".join(words).lower()
-    scored = sorted(((difflib.SequenceMatcher(None, phrase, (m.get("name") or "").lower()).ratio(), m) for m in models_seen.values()),
-                    key=lambda x: (-x[0], -((x[1].get("stats") or {}).get("downloadCount") or 0)))
-    possible = [_civitai_suggestion(m, show_nsfw) for score, m in scored[:3] if phrase and score >= 0.45]
+    # Nothing with this file name: offer the models (and the version) that look most like it.
+    scored = []
+    for m in models_seen.values():
+        best = max(((suggestion_score(filename, m.get("name"), f.get("name")), v, f)
+                    for v in m.get("modelVersions") or [] for f in v.get("files") or []), key=lambda x: x[0], default=None)
+        if best:
+            scored.append((best[0], m, best[1], best[2]))
+    scored.sort(key=lambda x: (-x[0], -((x[1].get("stats") or {}).get("downloadCount") or 0)))
+    possible = [dict(_civitai_suggestion(m, show_nsfw, v, f), score=score) for score, m, v, f in scored[:3] if score >= 0.45]
     if likely:
         try:
             cand = sources.civitai_version(likely[1], token, likely[2], show_nsfw)
@@ -264,7 +289,103 @@ def civitai_find(filename, category, settings):
     return {"confidence": "possible", "candidate": None, "possible": possible} if possible else None
 
 
-def find_model(filename, category, settings, library, embedded_url=""):
+def _repo_files(repo, revision="main", folder="", token=""):
+    """Model files in a Hugging Face repo (or one folder of it), cached for an hour."""
+    def load():
+        try:
+            return sources.hf_files(repo, revision, token, folder)["files"]
+        except Exception as exc:
+            log.info("Listing %s/%s failed: %s", repo, folder, exc)
+            return []
+    return _cached(f"repo_files:{repo}:{revision}:{folder}", 3600, load)
+
+
+def _civitai_model_files(model_id, token=""):
+    def load():
+        try:
+            return sources._get_json(f"{sources.CIVITAI}/models/{model_id}", sources._civitai_headers(token))
+        except Exception as exc:
+            log.info("Civitai model %s failed: %s", model_id, exc)
+            return {}
+    return _cached(f"civitai_model:{model_id}", 3600, load)
+
+
+def openmodeldb_index():
+    """{basename_lower: {url, name}} for every upscaler on OpenModelDB (cached for a day)."""
+    def load():
+        try:
+            data = sources._get_json("https://openmodeldb.info/api/v1/models.json")
+        except Exception as exc:
+            log.info("OpenModelDB unavailable: %s", exc)
+            return {}
+        out = {}
+        for key, m in data.items():
+            for r in m.get("resources") or []:
+                for url in r.get("urls") or []:
+                    name = os.path.basename(urllib.parse.urlparse(url).path)
+                    if sources.is_model_file(name) and not name.endswith(".onnx"):
+                        out.setdefault(name.lower(), {"url": url, "name": m.get("name") or key, "key": key})
+        return out
+    return _cached("openmodeldb", 86400, load)
+
+
+def hint_lookup(filename, hints, settings):
+    """Find a file through the workflow's own notes: a direct link, a file in a linked folder or
+    repository, or a Civitai model linked there. Returns a find_model result or None."""
+    if not hints:
+        return None
+    key = os.path.basename(filename).lower()
+    token = settings.get("hf_token")
+    for f in hints.get("files") or []:
+        if f["filename"].lower() == key:
+            if f["repo"]:
+                path = f["url"].split("/resolve/", 1)[1].split("/", 1)[1]
+                cand = {"source": "hf", "name": os.path.basename(path), "filename": os.path.basename(path), "url": f["url"],
+                        "size": next((x["size"] for x in _repo_files(f["repo"], token=token) if x["path"] == path), 0),
+                        "sha256": "", "preview": "", "page_url": f"https://huggingface.co/{f['repo']}"}
+            else:
+                cand = {"source": "url", "name": f["filename"], "filename": f["filename"], "url": f["url"], "size": 0,
+                        "sha256": "", "preview": "", "page_url": ""}
+            return {"origin": "workflow-note", "confidence": "exact", "candidate": cand, "category": f["category"]}
+    scopes = [(d["repo"], d["revision"], d["folder"], d["category"]) for d in hints.get("folders") or []]
+    scopes += [(r, "main", "", "") for r in hints.get("repos") or [] if not any(s[0] == r and not s[2] for s in scopes)]
+    for repo, rev, folder, cat in scopes[:12]:
+        for f in _repo_files(repo, rev, folder, token):
+            if os.path.basename(f["path"]).lower() == key:
+                cand = {"source": "hf", "name": os.path.basename(f["path"]), "filename": os.path.basename(f["path"]),
+                        "url": f["url"], "size": f["size"], "sha256": "", "preview": "", "page_url": f"https://huggingface.co/{repo}"}
+                return {"origin": f"workflow-note:{repo}", "confidence": "exact", "candidate": cand,
+                        "category": cat or workflows.category_in_text(os.path.dirname(f["path"]))}
+    for mid in (hints.get("civitai") or [])[:5]:
+        m = _civitai_model_files(mid, settings.get("civitai_token"))
+        for v in m.get("modelVersions") or []:
+            for f in v.get("files") or []:
+                if _norm_filename(f.get("name")) == _norm_filename(key):
+                    try:
+                        cand = sources.civitai_version(v["id"], settings.get("civitai_token"), f.get("id"), bool(settings.get("show_nsfw")))
+                        return {"origin": "workflow-note", "confidence": "exact", "candidate": cand, "category": ""}
+                    except Exception as exc:
+                        log.info("Civitai version %s unavailable: %s", v["id"], exc)
+    return None
+
+
+def hint_suggestions(filename, hints, settings, limit=4):
+    """Files in the repositories the notes link whose names look like this one (renamed files)."""
+    want = _norm_filename(filename)
+    token = settings.get("hf_token")
+    scored = []
+    for repo in (hints or {}).get("repos", [])[:8]:
+        for f in _repo_files(repo, token=token):
+            score = suggestion_score(filename, repo, os.path.basename(f["path"]))
+            if score >= 0.45:
+                scored.append((score, repo, f))
+    scored.sort(key=lambda x: -x[0])
+    return [{"source": "hf", "name": f"{repo} / {f['path']}", "base_model": "", "filename": os.path.basename(f["path"]),
+             "size": f["size"], "preview": "", "page_url": f"https://huggingface.co/{repo}", "url": f["url"], "score": score}
+            for score, repo, f in scored[:limit]]
+
+
+def find_model(filename, category, settings, library, embedded_url="", hints=None):
     """Best download candidate for a missing model file, with where it came from."""
     key = filename.lower()
     for item in library:
@@ -280,6 +401,15 @@ def find_model(filename, category, settings, library, embedded_url=""):
                 return {"origin": "workflow", "confidence": "exact", "candidate": cand}
         except Exception as exc:
             log.info("Embedded URL for %s did not resolve: %s", filename, exc)
+    found_in_notes = hint_lookup(filename, hints, settings)
+    if found_in_notes:
+        return found_in_notes
+    if category in ("upscale_models", "", None) and not is_generic_name(filename):
+        omdb = openmodeldb_index().get(key)
+        if omdb:
+            return {"origin": "openmodeldb", "confidence": "exact", "category": "upscale_models", "candidate": {
+                "source": "url", "name": omdb["name"], "filename": filename, "url": omdb["url"], "size": 0, "sha256": "",
+                "preview": "", "page_url": f"https://openmodeldb.info/models/{omdb['key']}", "category": "upscale_models"}}
     found = []
     generic = is_generic_name(filename)
     for m in manager_models().get(key) or []:
@@ -336,6 +466,11 @@ def find_model(filename, category, settings, library, embedded_url=""):
                      + ("" if settings.get("hf_token") else " and add a Hugging Face token in Settings"))
         return f
     civ = civitai_find(filename, category, settings)
+    from_repos = hint_suggestions(filename, hints, settings)
+    if from_repos:
+        civ = civ or {"confidence": "possible", "candidate": None, "possible": []}
+        civ["possible"] = sorted(from_repos + (civ.get("possible") or []), key=lambda x: -(x.get("score") or 0))
+        civ["note"] = civ.get("note") or "No file with this name. Similar files in the repositories this workflow links, and on Civitai"
     if civ and civ["candidate"]:
         civ["candidate"]["category"] = category or civ["candidate"]["category"]
         return {"origin": "civitai", "confidence": civ["confidence"], "candidate": civ["candidate"],
@@ -463,6 +598,8 @@ def workflow_node_types(workflow):
                 t = n.get("type")
                 if not t or t in subgraph_ids or t in FRONTEND_ONLY or t.startswith("workflow>"):
                     continue
+                if not n.get("inputs") and not n.get("outputs") and "inputs" in n and "outputs" in n:
+                    continue  # no inputs or outputs: a display-only node drawn by JavaScript (labels, notes)
                 cnr = (n.get("properties") or {}).get("cnr_id")
                 if cnr and cnr != "comfy-core":
                     out[t] = cnr
@@ -475,7 +612,7 @@ def workflow_node_types(workflow):
     return out
 
 
-def missing_nodes(workflow, reported=None):
+def missing_nodes(workflow, reported=None, hints=None):
     used = workflow_node_types(workflow)
     try:
         have = installed_node_types()
@@ -500,14 +637,36 @@ def missing_nodes(workflow, reported=None):
         infos = [i for i in (_pack_info(k, packs) for k in dict.fromkeys(keys)) if i]
         infos.sort(key=lambda p: (cnr not in (p["id"], p["key"]), -(p.get("stars") or 0)))
         pack = infos[0] if infos else None
-        out.append({"type": t, "pack": _pack_summary(pack), "alternatives": [_pack_summary(p) for p in infos[1:4]]})
+        via_notes = False
+        if not pack:
+            pack, via_notes = _pack_from_notes(t, hints, packs), True
+        out.append({"type": t, "pack": _pack_summary(pack), "alternatives": [_pack_summary(p) for p in infos[1:4]],
+                    "via_notes": bool(pack) and via_notes})
     return out
+
+
+def _pack_from_notes(node_type, hints, packs):
+    """A custom node repository linked in the workflow's notes that probably provides node_type:
+    one whose name shares a word with the type ('DaSiWa_Watermark' <- ComfyUI-DaSiWa-Nodes), else the
+    only linked pack that isn't installed."""
+    linked = []
+    for g in (hints or {}).get("github") or []:
+        info = _pack_info(g["url"], packs) or {"id": g["url"], "key": g["url"], "title": g["repo"], "repository": g["url"],
+                                               "state": "not-installed", "version": "unknown", "git_url": g["url"]}
+        words = [w for w in re.split(r"[^a-z0-9]+", g["repo"].lower()) if len(w) >= 4 and w not in ("comfyui", "nodes", "node", "custom", "pack", "suite")]
+        linked.append((any(w in node_type.lower() for w in words), info.get("state") in ("enabled", "installed"), info))
+    named = [(installed, i) for hit, installed, i in linked if hit]
+    if named:
+        # Named after a linked pack: that pack, unless it's installed already (then it isn't a pack problem).
+        return None if any(installed for installed, _i in named) else named[0][1]
+    missing = [i for _hit, installed, i in linked if not installed]
+    return missing[0] if len(missing) == 1 else None
 
 
 def _pack_summary(p):
     if not p:
         return None
-    return {"id": p["key"], "title": p.get("title") or p["id"], "repository": p.get("repository") or (p.get("files") or [""])[0],
+    return {"id": p["key"], "title": p.get("title") or p["id"], "git_url": p.get("git_url"), "repository": p.get("repository") or (p.get("files") or [""])[0],
             "stars": p.get("stars") or 0, "state": p.get("state") or "not-installed", "version": p.get("version") or "unknown",
             "description": (p.get("description") or "")[:200]}
 
@@ -518,6 +677,17 @@ def install_packs(pack_ids):
     results = {}
     for pid in dict.fromkeys(pack_ids):
         p = _pack_info(pid, packs)
+        if not p and re.match(r"https://github\.com/[\w.\-]+/[\w.\-]+$", pid):
+            # Not in Manager's registry: Manager installs it from the git URL only if allowed in its config.
+            r = requests.post(config.COMFY_URL + "/customnode/install/git_url", json={"url": pid}, timeout=600)
+            if r.ok:
+                results[pid] = "installed"
+            elif r.status_code == 403:
+                results[pid] = ("ComfyUI-Manager only installs packs that aren't in its registry when allow_git_url_install = True "
+                                "is set in ComfyUI/user/__manager/config.ini; set it and restart ComfyUI, or install the pack by hand")
+            else:
+                results[pid] = f"install failed ({r.status_code}): {r.text[:160]}"
+            continue
         if not p:
             results[pid] = "not found in ComfyUI-Manager's list"
             continue
@@ -544,6 +714,7 @@ def manager_queue_status():
 # ---- the plan ----------------------------------------------------------------------------------
 def plan(workflow, library, settings, reported_missing_nodes=None):
     analysis = workflows.analyze(workflow, library)
+    hints = workflows.hints(workflow) if isinstance(workflow.get("nodes"), list) else {}
     # The workflow's base model family (from its checkpoint / diffusion model names), to rank suggestions.
     fams = [base_family(m["filename"]) for m in analysis["models"] if m.get("category") in ("checkpoints", "diffusion_models", "unet")]
     wf_family = max(set(f for f in fams if f), key=fams.count, default=None)
@@ -551,9 +722,10 @@ def plan(workflow, library, settings, reported_missing_nodes=None):
     for m in analysis["models"]:
         entry = {**m, "fix": None, "origin": None, "alternatives": [], "confidence": None, "possible": []}
         if m["status"] == "wrong_folder" and m["category"]:
-            entry["fix"] = {"kind": "move", "from": m["installed_in"][0], "to": m["category"]}
+            src = m.get("installed_as") or [(m["installed_in"][0], m["filename"])]
+            entry["fix"] = {"kind": "move", "from": src[0][0], "from_name": src[0][1], "to": m["category"], "to_name": m["name"]}
         elif m["status"] != "installed":
-            found = find_model(m["filename"], m["category"], settings, library, m.get("url") or "")
+            found = find_model(m["filename"], m["category"], settings, library, m.get("url") or "", hints)
             if found:
                 possible = found.get("possible") or []
                 for p in possible:
@@ -566,23 +738,30 @@ def plan(workflow, library, settings, reported_missing_nodes=None):
                              preview=cand.get("preview") or entry.get("preview"),
                              fix={"kind": "download", "candidate": {k: v for k, v in cand.items() if k not in ("versions",)},
                                   "size": cand.get("size") or 0})
-                entry["category"] = entry["category"] or cand.get("category")
+                entry["category"] = entry["category"] or found.get("category") or cand.get("category")
+                # Save it where the workflow looks: its own name, sub-folder included.
+                entry["fix"]["candidate"].update(filename=m["name"], category=entry["category"])
+            elif found and found.get("category") and not entry["category"]:
+                entry["category"] = found["category"]
         out_models.append(entry)
     nodes_error = ""
     try:
-        nodes = missing_nodes(workflow, reported_missing_nodes)
+        nodes = missing_nodes(workflow, reported_missing_nodes, hints)
     except Exception as exc:
         nodes, nodes_error = [], str(exc)
     # Gated files need a licence accepted, and "likely" (near-identical file name) matches need a look.
-    auto = [e for e in out_models if e["fix"] and not (e["fix"].get("candidate") or {}).get("gated") and e["confidence"] != "likely"]
+    # Models of switched-off nodes aren't needed to run the workflow as it is: offer them, don't fetch them.
+    auto = [e for e in out_models if e["fix"] and not (e["fix"].get("candidate") or {}).get("gated")
+            and e["confidence"] != "likely" and not e.get("optional")]
     need = sum(e["fix"]["size"] for e in auto if e["fix"]["kind"] == "download")
     free = shutil.disk_usage(config.WORKSPACE).free if config.WORKSPACE.exists() else None
-    unresolved = [e["filename"] for e in out_models if e["status"] != "installed" and not e["fix"]]
+    unresolved = [e["filename"] for e in out_models if e["status"] != "installed" and not e["fix"] and not e.get("optional")]
     return {
         "models": out_models,
         "nodes": nodes,
         "summary": {
-            "models_missing": sum(1 for e in out_models if e["status"] != "installed"),
+            "models_missing": sum(1 for e in out_models if e["status"] != "installed" and not e.get("optional")),
+            "models_optional": sum(1 for e in out_models if e["status"] != "installed" and e.get("optional")),
             "models_fixable": len(auto),  # gated files need the user to accept a licence first
             "nodes_missing": len(nodes),
             "nodes_fixable": sum(1 for n in nodes if n["pack"] and n["pack"]["state"] not in ("enabled", "installed")),

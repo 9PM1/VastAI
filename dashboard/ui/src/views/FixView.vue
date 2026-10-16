@@ -40,7 +40,8 @@ const STATUS = {
   missing: { label: 'Missing', tone: 'danger' },
 }
 const ORIGIN = (o) => !o ? '' : o === 'library' ? 'Your library' : o === 'workflow' ? 'Link in workflow' : o === 'comfyui-manager' ? 'ComfyUI-Manager list'
-  : o === 'civitai' ? 'Civitai' : o.startsWith('huggingface:') ? `Hugging Face · ${o.slice(12)}` : o
+  : o === 'civitai' ? 'Civitai' : o === 'workflow-note' ? 'Link in the workflow\'s notes'
+  : o === 'openmodeldb' ? 'OpenModelDB' : o.startsWith('workflow-note:') ? `Folder linked in the notes · ${o.slice(14)}` : o.startsWith('huggingface:') ? `Hugging Face · ${o.slice(12)}` : o
 
 async function analyze(wf, label, missingNodes = []) {
   workflow.value = wf; source.value = label; analyzing.value = true; applied.value = false; packs.value = {}
@@ -75,16 +76,24 @@ onMounted(() => {
 })
 
 const missingModels = computed(() => (plan.value?.models || []).filter((m) => m.status !== 'installed'))
+// Models only switched-off (muted / bypassed) or overridden nodes use: not needed to run the workflow as it is.
+const requiredModels = computed(() => missingModels.value.filter((m) => !m.optional))
+const optionalModels = computed(() => missingModels.value.filter((m) => m.optional))
+const modelSections = computed(() => [
+  { key: 'required', models: requiredModels.value },
+  { key: 'optional', models: optionalModels.value },
+].filter((s) => s.models.length))
 const okModels = computed(() => (plan.value?.models || []).filter((m) => m.status === 'installed'))
 // Fix all leaves out gated Hugging Face files (licence first) and near-identical file names (check first).
-const fixableModels = computed(() => missingModels.value.filter((m) => m.fix && !m.fix.candidate?.gated && m.confidence !== 'likely'))
-const unresolved = computed(() => missingModels.value.filter((m) => !m.fix && !m.possible?.length))
+const fixableModels = computed(() => requiredModels.value.filter((m) => m.fix && !m.fix.candidate?.gated && m.confidence !== 'likely'))
+const unresolved = computed(() => requiredModels.value.filter((m) => !m.fix && !m.possible?.length))
 const nodes = computed(() => plan.value?.nodes || [])
 const installablePacks = computed(() => [...new Set(nodes.value.filter((n) => n.pack && !['enabled', 'installed'].includes(n.pack.state)).map((n) => n.pack.id))])
 const need = computed(() => fixableModels.value.reduce((s, m) => s + (m.fix.kind === 'download' ? m.fix.size || 0 : 0), 0))
 const fits = computed(() => !plan.value?.summary?.disk_free || need.value < plan.value.summary.disk_free * 0.97)
-const allGood = computed(() => plan.value && !missingModels.value.length && !nodes.value.length)
-const taskFor = (m) => app.downloadList.find((t) => t.filename === m.filename && t.category === m.category && !['cancelled'].includes(t.status))
+const allGood = computed(() => plan.value && !requiredModels.value.length && !nodes.value.length)
+const taskFor = (m) => app.downloadList.find((t) => (t.filename === m.name || t.filename === m.filename) && t.category === m.category && !['cancelled'].includes(t.status))
+const folderOf = (m) => m.name !== m.filename ? m.name.slice(0, -m.filename.length) : ''
 
 // Live progress of the downloads this plan started.
 const planTasks = computed(() => fixableModels.value.map(taskFor).filter(Boolean))
@@ -99,7 +108,7 @@ async function fixAll(force = false) {
   confirmDisk.value = false; applying.value = true
   try {
     const r = await api.post('fix/apply', {
-      models: fixableModels.value.map((m) => ({ filename: m.filename, category: m.category, fix: m.fix })),
+      models: fixableModels.value.map((m) => ({ name: m.name, filename: m.filename, category: m.category, fix: m.fix })),
       packs: installablePacks.value,
     })
     applied.value = true; packs.value = r.packs || {}; restartNeeded.value = restartNeeded.value || r.restart_needed
@@ -111,7 +120,7 @@ async function fixAll(force = false) {
 }
 async function fixOne(m) {
   try {
-    await api.post('fix/apply', { models: [{ filename: m.filename, category: m.category, fix: m.fix }] })
+    await api.post('fix/apply', { models: [{ name: m.name, filename: m.filename, category: m.category, fix: m.fix }] })
     applied.value = true
     if (m.fix.kind === 'move') { bridge.refreshModels(); setTimeout(reanalyze, 800) }
   } catch (e) { app.toast(e.message, 'error') }
@@ -119,9 +128,9 @@ async function fixOne(m) {
 // A model the user picked for a file nobody could match exactly (Civitai, Hugging Face or Manager's list).
 async function useSuggestion(m, s) {
   try {
-    await api.post('fix/use', { filename: m.filename, category: m.category, ...(s.version_id ? { version_id: s.version_id, file_id: s.file_id } : { url: s.url }) })
+    await api.post('fix/use', { filename: m.name, category: m.category, ...(s.version_id ? { version_id: s.version_id, file_id: s.file_id } : { url: s.url }) })
     applied.value = true
-    app.toast(`Downloading ${s.name} as ${m.filename}`, 'success', 'Saved to your library, so this workflow finds it next time.')
+    app.toast(`Downloading ${s.name} as ${m.name}`, 'success', 'Saved to your library, so this workflow finds it next time.')
   } catch (e) { app.toast(e.message, 'error') }
 }
 async function installPack(id) {
@@ -203,7 +212,8 @@ const addOpen = ref(false)
         <template v-else>
           <div class="mt-3 flex flex-wrap gap-1.5">
             <Tag v-if="nodes.length" tone="danger">{{ nodes.length }} missing node type{{ nodes.length > 1 ? 's' : '' }}</Tag>
-            <Tag v-if="missingModels.length" tone="danger">{{ missingModels.length }} missing model{{ missingModels.length > 1 ? 's' : '' }}</Tag>
+            <Tag v-if="requiredModels.length" tone="danger">{{ requiredModels.length }} missing model{{ requiredModels.length > 1 ? 's' : '' }}</Tag>
+            <Tag v-if="optionalModels.length" :title="'Only used by switched-off nodes'">{{ optionalModels.length }} optional</Tag>
             <Tag v-if="fixableModels.length + installablePacks.length" tone="primary">{{ fixableModels.length + installablePacks.length }} fixable automatically</Tag>
             <Tag v-if="okModels.length" tone="ok">{{ okModels.length }} installed</Tag>
           </div>
@@ -243,10 +253,12 @@ const addOpen = ref(false)
                 <Package class="size-3" /> {{ n.pack.title }} <span v-if="n.pack.stars" class="flex items-center gap-0.5"><Star class="size-3" />{{ n.pack.stars }}</span>
                 <a v-if="n.pack.repository" :href="n.pack.repository" target="_blank" rel="noopener" class="hover:text-fg" :aria-label="`${n.pack.title} repository`"><ExternalLink class="size-3" /></a>
               </p>
-              <p v-else class="mt-0.5 text-[11px] text-danger-hover">{{ n.note || 'No node pack in ComfyUI-Manager provides this node' }}</p>
+              <p v-if="n.pack && n.via_notes" class="mt-0.5 text-[11px] text-fg2">Linked in this workflow's notes{{ n.pack.git_url ? ' · installs from GitHub' : '' }}</p>
+              <p v-if="!n.pack" class="mt-0.5 text-[11px] text-danger-hover">{{ n.note || 'No node pack in ComfyUI-Manager provides this node' }}</p>
             </div>
             <template v-if="n.pack">
-              <Tag v-if="packs[n.pack.id]" :tone="packs[n.pack.id] === 'queued' ? 'primary' : packs[n.pack.id] === 'already installed' ? 'ok' : 'danger'">{{ packs[n.pack.id] === 'queued' ? 'Installing' : packs[n.pack.id] }}</Tag>
+              <Tag v-if="packs[n.pack.id]" :tone="packs[n.pack.id] === 'queued' ? 'primary' : ['already installed', 'installed'].includes(packs[n.pack.id]) ? 'ok' : 'danger'" :title="packs[n.pack.id]">{{ packs[n.pack.id] === 'queued' ? 'Installing' : packs[n.pack.id] === 'installed' ? 'Installed, restart ComfyUI' : packs[n.pack.id].length > 40 ? 'Not installed' : packs[n.pack.id] }}</Tag>
+              <p v-if="packs[n.pack.id] && packs[n.pack.id].length > 40" class="w-full text-[11px] text-danger-hover">{{ packs[n.pack.id] }}</p>
               <Tag v-else-if="['enabled', 'installed'].includes(n.pack.state)" tone="warn">Installed, needs restart</Tag>
               <Btn v-else size="sm" @click="installPack(n.pack.id)"><Download class="size-3.5" /> Install pack</Btn>
             </template>
@@ -256,16 +268,20 @@ const addOpen = ref(false)
       </section>
 
       <!-- Models -->
-      <section v-if="missingModels.length" class="mb-4">
-        <h3 class="mb-2 flex items-center gap-1.5 text-xs font-medium uppercase tracking-wide text-muted"><HardDrive class="size-3.5" /> Missing models</h3>
-        <ul class="divide-y divide-stroke overflow-hidden rounded-xl border border-subtle bg-panel">
-          <li v-for="m in missingModels" :key="m.name" class="flex flex-wrap items-center gap-x-3 gap-y-1.5 px-4 py-2.5">
+      <section v-for="sec in modelSections" :key="sec.key" class="mb-4">
+        <h3 v-if="sec.key === 'required'" class="mb-2 flex items-center gap-1.5 text-xs font-medium uppercase tracking-wide text-muted"><HardDrive class="size-3.5" /> Missing models</h3>
+        <template v-else>
+          <h3 class="mb-1 flex items-center gap-1.5 text-xs font-medium uppercase tracking-wide text-muted"><HardDrive class="size-3.5" /> Optional models</h3>
+          <p class="mb-2 text-xs text-fg2">Only used by nodes that are switched off (muted or bypassed), or replaced by a subgraph's settings. Fix all leaves them out; get them if you turn those nodes on.</p>
+        </template>
+        <ul class="divide-y divide-stroke overflow-hidden rounded-xl border border-subtle bg-panel" :class="sec.key === 'optional' && 'opacity-80'">
+          <li v-for="m in sec.models" :key="m.name" class="flex flex-wrap items-center gap-x-3 gap-y-1.5 px-4 py-2.5">
             <div class="min-w-0 flex-1 basis-56">
-              <p class="truncate font-mono text-[13px]" :title="m.name">{{ m.filename }}</p>
+              <p class="truncate font-mono text-[13px]" :title="m.name"><span class="text-muted">{{ folderOf(m) }}</span>{{ m.filename }}</p>
               <p class="mt-0.5 truncate text-[11px] text-muted">
                 {{ m.category ? app.categoryLabel(m.category) : 'Unknown folder' }}
                 <template v-if="m.fix?.kind === 'download'"> · {{ ORIGIN(m.origin) }}<template v-if="m.fix.size"> · {{ bytes(m.fix.size) }}</template></template>
-                <template v-if="m.fix?.kind === 'move'"> · in {{ m.fix.from }}</template>
+                <template v-if="m.fix?.kind === 'move'"> · in {{ m.fix.from }}/{{ m.fix.from_name || m.filename }}</template>
               </p>
               <p v-if="m.fix?.candidate?.gated && !taskFor(m)" class="mt-1 text-[11px] text-warn">
                 {{ m.note }}. <a :href="m.fix.candidate.page_url" target="_blank" rel="noopener" class="underline hover:text-fg">Open model page</a>
@@ -278,11 +294,13 @@ const addOpen = ref(false)
                 <p class="mb-1 text-[11px] text-fg2">{{ m.note || 'No file with this name. Models on Civitai that look like it' }}:</p>
                 <ul class="space-y-1">
                   <li v-for="s in m.possible" :key="s.version_id || s.url" class="flex items-center gap-2 rounded-md bg-surface px-2 py-1.5">
-                    <img v-if="s.preview" :src="s.preview" alt="" class="size-8 shrink-0 rounded object-cover" :class="s.preview_mature && !app.settings?.show_nsfw && 'blur-sm'" loading="lazy" />
+                    <img v-if="s.preview" :src="s.preview" alt="" class="size-8 shrink-0 rounded object-cover" :class="s.preview_mature && !app.settings?.show_nsfw && 'blur-sm'" loading="lazy" @error="$event.target.style.display = 'none'" />
                     <div class="min-w-0 flex-1">
                       <a :href="s.page_url" target="_blank" rel="noopener" class="block truncate text-xs hover:underline" :title="s.name">{{ s.name }}</a>
                       <p class="truncate text-[11px] text-muted">
-                        <span v-if="s.fits_base" class="text-ok">Matches your base model · </span>{{ [s.base_model, s.size && bytes(s.size), { civitai: 'Civitai', hf: 'Hugging Face' }[s.source] || 'ComfyUI-Manager list'].filter(Boolean).join(' · ') }}
+                        <span v-if="s.fits_base" class="text-ok">Matches your base model · </span>{{ [s.source === 'civitai' && s.version_name, s.base_model, s.size && bytes(s.size), { civitai: 'Civitai', hf: 'Hugging Face' }[s.source] || 'ComfyUI-Manager list'].filter(Boolean).join(' · ') }}
+                      </p>
+                      <p v-if="s.source === 'civitai' && s.filename" class="truncate font-mono text-[10px] text-muted" :title="s.filename">{{ s.filename }}
                       </p>
                     </div>
                     <Btn size="sm" variant="ghost" :aria-label="`Use ${s.name} for ${m.filename}`" @click="useSuggestion(m, s)"><Download class="size-3.5" /> Use</Btn>
@@ -303,8 +321,9 @@ const addOpen = ref(false)
             </template>
             <template v-else-if="m.fix">
               <Tag v-if="m.confidence === 'likely'" tone="warn">Check match</Tag>
+              <Tag v-else-if="m.optional">Not needed now</Tag>
               <Tag v-else :tone="STATUS[m.status].tone">{{ STATUS[m.status].label }}</Tag>
-              <Btn size="sm" @click="fixOne(m)"><component :is="m.fix.kind === 'move' ? FolderInput : Download" class="size-3.5" /> {{ m.fix.kind === 'move' ? `Move to ${m.fix.to}` : 'Download' }}</Btn>
+              <Btn size="sm" @click="fixOne(m)"><component :is="m.fix.kind === 'move' ? FolderInput : Download" class="size-3.5" /> {{ m.fix.kind === 'move' ? (m.fix.to === m.fix.from ? `Move into ${folderOf(m) || 'folder root'}` : `Move to ${m.fix.to}`) : 'Download' }}</Btn>
             </template>
             <div v-else-if="!m.possible?.length" class="flex w-full flex-wrap justify-end gap-1.5 sm:w-auto">
               <Btn size="sm" variant="ghost" @click="findOnline(m, 'civitai')"><Search class="size-3.5" /> Civitai</Btn>
