@@ -63,7 +63,8 @@ const snooze = () => api.post('autostop/snooze').then((s) => (app.autostop = s))
     <div class="flex min-w-0 flex-1 flex-col">
       <StatusBar />
       <!-- Auto-stop warning -->
-      <div v-if="app.autostop?.warned || app.autostop?.stopping" class="flex flex-wrap items-center gap-2 border-b border-stroke bg-[color-mix(in_srgb,var(--warning)_14%,transparent)] px-4 py-2 text-xs text-warn" role="alert">
+      <!-- Inside ComfyUI the extension shows this banner itself. -->
+      <div v-if="!embedded && (app.autostop?.warned || app.autostop?.stopping)" class="flex flex-wrap items-center gap-2 border-b border-stroke bg-[color-mix(in_srgb,var(--warning)_14%,transparent)] px-4 py-2 text-xs text-warn" role="alert">
         <Clock class="size-4" />
         <span class="flex-1">{{ app.autostop.stopping ? 'Instance is idle and stopping now…' : `Instance idle: it will stop in about ${stopsIn} min to save money.` }}</span>
         <Btn v-if="!app.autostop.stopping" size="sm" variant="primary" @click="snooze">Keep running</Btn>

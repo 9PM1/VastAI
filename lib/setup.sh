@@ -28,6 +28,8 @@ if [[ -n "${XTRA_MODEL_VOLUME:-}" ]]; then
   if [[ -d "$XTRA_MODEL_VOLUME" ]]; then
     for folder in $MODEL_FOLDERS; do
       src="$COMFY_BASE/$folder" dst="$XTRA_MODEL_VOLUME/models/$folder"
+      # Leave aliases alone (the image links ckpt -> checkpoints); they follow their target.
+      [[ -L "$src" && "$(readlink "$src")" != "$dst" ]] && continue
       mkdir -p "$dst"
       if [[ -d "$src" && ! -L "$src" ]]; then
         find "$src" -mindepth 1 -maxdepth 1 -exec mv -n {} "$dst"/ \;
