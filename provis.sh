@@ -21,6 +21,7 @@ fetch_repo() {
        "https://codeload.github.com/${XTRA_REPO}/tar.gz/${XTRA_REF}" \
      | tar -xz -C "$tmp" --strip-components=1 \
      && [ -f "$tmp/lib/main.sh" ]; then
+    chmod 755 "$tmp"
     rm -rf "$XTRA_DIR"
     mv "$tmp" "$XTRA_DIR"
     return 0

@@ -93,8 +93,11 @@ if (( ${#boost_flags[@]} )); then
   printf 'COMFYUI_ARGS=%q # comfy-xtra-boost\n' "$comfy_args" >> "$COMFY_DOTENV"
   BOOST_SUMMARY="${boost_flags[*]}"
   log "Speed boost enabled: $BOOST_SUMMARY (COMFYUI_ARGS=$comfy_args)"
-  # ComfyUI normally waits for provisioning to finish; restart it if it is already up.
-  if command -v supervisorctl >/dev/null 2>&1 && [[ ! -f /.provisioning ]]; then
+  # The ComfyUI launcher reads COMFYUI_ARGS when it starts, and on first boot it
+  # has already started (and is waiting for /.provisioning to go away) before we
+  # get here. Restart it so it re-reads the env; if provisioning is still running
+  # it simply goes back to waiting.
+  if command -v supervisorctl >/dev/null 2>&1; then
     supervisorctl restart comfyui >/dev/null 2>&1 || true
   fi
 elif [[ -f "$COMFY_DOTENV" ]]; then
