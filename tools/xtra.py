@@ -615,7 +615,17 @@ def cmd_rent(a):
         iid = (r or {}).get("new_contract") or die(f"rent failed: {r}")
         started = time.time()
         print(f"Rented instance {iid}. Waiting for it to boot and provision (about 1-3 minutes)…")
-        inst = wait_ready(iid)
+        try:
+            inst = wait_ready(iid)
+        except HostFailed as exc:
+            remember_bad(o["machine_id"], o["gpu_name"], f"container {exc}")
+            print(f"Host failed: {exc}. Machine {o['machine_id']} will be skipped for {BAD_HOST_DAYS} days.")
+            vast("destroy", "instance", str(iid), raw=False)
+            bad[str(o["machine_id"])] = {}
+            if attempt + 1 < tries:
+                print("Destroyed it; renting the next best host…")
+                continue
+            die(f"destroyed instance {iid}; run `xtra rent` again" + ("" if a.auto_swap else " (or add --auto-swap)"))
         print("Checking the host (VRAM, power, PCIe, disk, network; about a minute)…")
         h = wait_health(inst)
         if h and h["score"] == "poor":
@@ -640,12 +650,24 @@ def cmd_rent(a):
         return
 
 
-def wait_ready(iid, timeout=900):
+class HostFailed(Exception):
+    """The host never got the instance running (stuck loading, or Vast gave up on it)."""
+
+
+def wait_ready(iid, timeout=900, boot_timeout=480):
     t0 = time.time()
     inst = None
     while time.time() - t0 < timeout:
         inst = next((i for i in instances() if i["id"] == int(iid)), None)
-        if inst and inst.get("actual_status") == "running":
+        state = inst and inst.get("actual_status")
+        if inst and state != "running":
+            # A healthy host pulls the image and starts within a few minutes. Vast marks hosts that
+            # can't create the container as next_state/intended_status "stopped" while still "loading".
+            gave_up = "stopped" in (inst.get("intended_status"), inst.get("next_state")) and time.time() - t0 > 90
+            if gave_up or state in ("exited", "offline") or time.time() - t0 > boot_timeout:
+                raise HostFailed(f"never started (still {state or 'loading'} after {int(time.time() - t0)} s"
+                                 + (", Vast stopped it" if gave_up else "") + ")")
+        if inst and state == "running":
             out = ssh(inst, "ls /.provisioning_complete /.provisioning_failed 2>/dev/null; curl -fs -m 3 http://127.0.0.1:17890/api/health >/dev/null && echo DASH_OK", timeout=30) or ""
             if "DASH_OK" in out:
                 print(f"Ready after {int(time.time() - t0)} s.")

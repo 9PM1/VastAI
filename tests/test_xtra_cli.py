@@ -116,7 +116,7 @@ class BadHostMemory(unittest.TestCase):
 class AutoSwap(unittest.TestCase):
     """rent --auto-swap with Vast faked: the first host fails the check, the second passes."""
 
-    def run_rent(self, auto_swap, healths):
+    def run_rent(self, auto_swap, healths, wait_ready=None):
         calls, saved = [], {}
         offers = [dict(offer(i, "RTX 4090", 96, 0.5 + i / 100, 100 + i), _hourly=0.5, _fee=0.1, _cost_h=0.53, _ips=8900,
                        _ipd=16000, _perf=1.0, _measured=True, inet_down=1000, disk_bw=3000, geolocation="X") for i in (1, 2, 3)]
@@ -125,7 +125,7 @@ class AutoSwap(unittest.TestCase):
             "shared_data": lambda refresh=False: {"benchmarks": [], "hosts": []},
             "search_offers": lambda a, machine_id=None, bad=None, shared=None: ([o for o in offers if str(o["machine_id"]) not in bad], {"slow": 0, "bad": 0}),
             "vast": lambda *args, **kw: calls.append(args) or ({"new_contract": 900 + len(calls)} if args[0] == "create" else ""),
-            "wait_ready": lambda iid: {"id": iid},
+            "wait_ready": wait_ready or (lambda iid: {"id": iid}),
             "wait_health": lambda inst: healths.pop(0),
             "dash": lambda *args, **kw: None,
             "show_status": lambda inst: None,
@@ -150,6 +150,16 @@ class AutoSwap(unittest.TestCase):
     def test_swaps_poor_host_and_remembers_it(self):
         poor = {"score": "poor", "warnings": ["Power limited to 60%"]}
         calls = self.run_rent(True, [poor, {"score": "good", "warnings": []}])
+        self.assertEqual([c[:3] for c in calls], [("create", "instance", "1"), ("destroy", "instance", "901"), ("create", "instance", "2")])
+        self.assertIn("101", xtra.bad_hosts())
+
+    def test_host_that_never_starts_is_swapped(self):
+        def stuck_then_ok(iid, _n=[0]):
+            _n[0] += 1
+            if _n[0] == 1:
+                raise xtra.HostFailed("never started (still loading after 480 s)")
+            return {"id": iid}
+        calls = self.run_rent(True, [{"score": "good", "warnings": []}], wait_ready=stuck_then_ok)
         self.assertEqual([c[:3] for c in calls], [("create", "instance", "1"), ("destroy", "instance", "901"), ("create", "instance", "2")])
         self.assertIn("101", xtra.bad_hosts())
 
