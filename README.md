@@ -15,9 +15,16 @@ https://raw.githubusercontent.com/9PM1/VastAI/refs/heads/main/provis.sh
 - **Fixer, inside ComfyUI.** When a workflow loads, missing models and custom nodes are found and
   a toast offers to fix them. The ⚡ Xtra sidebar tab lists each one with where it will come from
   (your library, the workflow's own links, ComfyUI-Manager's model list, the Hugging Face repos of
-  Comfy-Org / Kijai / city96 / QuantStack / lllyasviel, or an exact Civitai filename match), the
-  download size against free disk, and installs node packs through ComfyUI-Manager. One click fixes
-  everything; the model lists refresh without reloading the page.
+  Comfy-Org / Kijai / city96 / QuantStack / lllyasviel, or Civitai), the download size against free
+  disk, and installs node packs through ComfyUI-Manager. One click fixes everything; the model lists
+  refresh without reloading the page.
+  Civitai is searched with the words in the file name (`RealisticSnapshotKrea2V2` → "Realistic
+  Snapshot"), which finds 90% of real Civitai files exactly. Files only match when their folder fits
+  (a `vae/` file never fills a ControlNet slot), and generic names such as
+  `diffusion_pytorch_model.safetensors`, or names several models share, are never downloaded on a
+  guess: you pick from suggestions ranked by your checkpoint's base model, and the pick is
+  remembered in your library. A downloaded file that turns out to be a VAE is refused anywhere but
+  the VAE folders.
 - **Library and bundles.** Save models (Civitai, Hugging Face, any URL) into bundles; turn a
   workflow's models into a bundle; mark bundles to install automatically on every new instance.
   Library entries are re-checked in the background and flagged when their source disappears.

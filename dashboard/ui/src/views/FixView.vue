@@ -40,7 +40,7 @@ const STATUS = {
   missing: { label: 'Missing', tone: 'danger' },
 }
 const ORIGIN = (o) => !o ? '' : o === 'library' ? 'Your library' : o === 'workflow' ? 'Link in workflow' : o === 'comfyui-manager' ? 'ComfyUI-Manager list'
-  : o === 'civitai' ? 'Civitai (exact file name)' : o.startsWith('huggingface:') ? `Hugging Face · ${o.slice(12)}` : o
+  : o === 'civitai' ? 'Civitai' : o.startsWith('huggingface:') ? `Hugging Face · ${o.slice(12)}` : o
 
 async function analyze(wf, label, missingNodes = []) {
   workflow.value = wf; source.value = label; analyzing.value = true; applied.value = false; packs.value = {}
@@ -76,9 +76,9 @@ onMounted(() => {
 
 const missingModels = computed(() => (plan.value?.models || []).filter((m) => m.status !== 'installed'))
 const okModels = computed(() => (plan.value?.models || []).filter((m) => m.status === 'installed'))
-// Gated Hugging Face files need a licence accepted first, so Fix all leaves them out.
-const fixableModels = computed(() => missingModels.value.filter((m) => m.fix && !m.fix.candidate?.gated))
-const unresolved = computed(() => missingModels.value.filter((m) => !m.fix))
+// Fix all leaves out gated Hugging Face files (licence first) and near-identical file names (check first).
+const fixableModels = computed(() => missingModels.value.filter((m) => m.fix && !m.fix.candidate?.gated && m.confidence !== 'likely'))
+const unresolved = computed(() => missingModels.value.filter((m) => !m.fix && !m.possible?.length))
 const nodes = computed(() => plan.value?.nodes || [])
 const installablePacks = computed(() => [...new Set(nodes.value.filter((n) => n.pack && !['enabled', 'installed'].includes(n.pack.state)).map((n) => n.pack.id))])
 const need = computed(() => fixableModels.value.reduce((s, m) => s + (m.fix.kind === 'download' ? m.fix.size || 0 : 0), 0))
@@ -114,6 +114,14 @@ async function fixOne(m) {
     await api.post('fix/apply', { models: [{ filename: m.filename, category: m.category, fix: m.fix }] })
     applied.value = true
     if (m.fix.kind === 'move') { bridge.refreshModels(); setTimeout(reanalyze, 800) }
+  } catch (e) { app.toast(e.message, 'error') }
+}
+// A model the user picked for a file nobody could match exactly (Civitai, Hugging Face or Manager's list).
+async function useSuggestion(m, s) {
+  try {
+    await api.post('fix/use', { filename: m.filename, category: m.category, ...(s.version_id ? { version_id: s.version_id, file_id: s.file_id } : { url: s.url }) })
+    applied.value = true
+    app.toast(`Downloading ${s.name} as ${m.filename}`, 'success', 'Saved to your library, so this workflow finds it next time.')
   } catch (e) { app.toast(e.message, 'error') }
 }
 async function installPack(id) {
@@ -262,6 +270,31 @@ const addOpen = ref(false)
               <p v-if="m.fix?.candidate?.gated && !taskFor(m)" class="mt-1 text-[11px] text-warn">
                 {{ m.note }}. <a :href="m.fix.candidate.page_url" target="_blank" rel="noopener" class="underline hover:text-fg">Open model page</a>
               </p>
+              <p v-if="m.confidence === 'likely' && m.fix && !taskFor(m)" class="mt-1 text-[11px] text-warn">
+                Closest file on Civitai is <span class="font-mono">{{ m.fix.candidate.filename }}</span> ({{ m.fix.candidate.name }}).
+                <a :href="m.fix.candidate.page_url" target="_blank" rel="noopener" class="underline hover:text-fg">Check it</a>, then download.
+              </p>
+              <div v-if="!m.fix && m.possible?.length && !taskFor(m)" class="mt-2">
+                <p class="mb-1 text-[11px] text-fg2">{{ m.note || 'No file with this name. Models on Civitai that look like it' }}:</p>
+                <ul class="space-y-1">
+                  <li v-for="s in m.possible" :key="s.version_id || s.url" class="flex items-center gap-2 rounded-md bg-surface px-2 py-1.5">
+                    <img v-if="s.preview" :src="s.preview" alt="" class="size-8 shrink-0 rounded object-cover" :class="s.preview_mature && !app.settings?.show_nsfw && 'blur-sm'" loading="lazy" />
+                    <div class="min-w-0 flex-1">
+                      <a :href="s.page_url" target="_blank" rel="noopener" class="block truncate text-xs hover:underline" :title="s.name">{{ s.name }}</a>
+                      <p class="truncate text-[11px] text-muted">
+                        <span v-if="s.fits_base" class="text-ok">Matches your base model · </span>{{ [s.base_model, s.size && bytes(s.size), { civitai: 'Civitai', hf: 'Hugging Face' }[s.source] || 'ComfyUI-Manager list'].filter(Boolean).join(' · ') }}
+                      </p>
+                    </div>
+                    <Btn size="sm" variant="ghost" :aria-label="`Use ${s.name} for ${m.filename}`" @click="useSuggestion(m, s)"><Download class="size-3.5" /> Use</Btn>
+                  </li>
+                </ul>
+                <p class="mt-1.5 flex flex-wrap items-center gap-1 text-[11px] text-muted">
+                  Not listed?
+                  <Btn size="sm" variant="ghost" @click="findOnline(m, 'civitai')"><Search class="size-3.5" /> Civitai</Btn>
+                  <Btn size="sm" variant="ghost" @click="findOnline(m, 'hf')"><Search class="size-3.5" /> Hugging Face</Btn>
+                  <Btn size="sm" variant="ghost" @click="addOpen = true"><Link2 class="size-3.5" /> Paste link</Btn>
+                </p>
+              </div>
               <p v-if="taskFor(m)?.status === 'failed'" class="mt-1 text-[11px] text-danger-hover">{{ taskFor(m).error }}</p>
               <div v-if="taskFor(m) && !['done'].includes(taskFor(m).status)" class="mt-1.5"><Bar :value="pct(taskFor(m).done, taskFor(m).size)" :indeterminate="!taskFor(m).size" :label="`${m.filename} progress`" /></div>
             </div>
@@ -269,17 +302,18 @@ const addOpen = ref(false)
               <Tag :tone="taskFor(m).status === 'done' ? 'ok' : taskFor(m).status === 'failed' ? 'danger' : 'primary'">{{ { done: 'Installed', failed: 'Failed', verifying: 'Verifying' }[taskFor(m).status] || 'Downloading' }}</Tag>
             </template>
             <template v-else-if="m.fix">
-              <Tag :tone="STATUS[m.status].tone">{{ STATUS[m.status].label }}</Tag>
+              <Tag v-if="m.confidence === 'likely'" tone="warn">Check match</Tag>
+              <Tag v-else :tone="STATUS[m.status].tone">{{ STATUS[m.status].label }}</Tag>
               <Btn size="sm" @click="fixOne(m)"><component :is="m.fix.kind === 'move' ? FolderInput : Download" class="size-3.5" /> {{ m.fix.kind === 'move' ? `Move to ${m.fix.to}` : 'Download' }}</Btn>
             </template>
-            <div v-else class="flex w-full flex-wrap justify-end gap-1.5 sm:w-auto">
+            <div v-else-if="!m.possible?.length" class="flex w-full flex-wrap justify-end gap-1.5 sm:w-auto">
               <Btn size="sm" variant="ghost" @click="findOnline(m, 'civitai')"><Search class="size-3.5" /> Civitai</Btn>
               <Btn size="sm" variant="ghost" @click="findOnline(m, 'hf')"><Search class="size-3.5" /> Hugging Face</Btn>
               <Btn size="sm" @click="addOpen = true"><Link2 class="size-3.5" /> Paste link</Btn>
             </div>
           </li>
         </ul>
-        <p v-if="unresolved.length" class="mt-1.5 text-xs text-fg2">{{ unresolved.length }} model(s) weren't found by exact file name anywhere. Search for them, or paste a link; saving them to your library makes them resolve automatically next time.</p>
+        <p v-if="unresolved.length" class="mt-1.5 text-xs text-fg2">{{ unresolved.length }} model(s) weren't found anywhere. Search for them, or paste a link; saving them to your library makes them resolve automatically next time.</p>
       </section>
 
       <details v-if="okModels.length" class="rounded-xl border border-subtle bg-panel">

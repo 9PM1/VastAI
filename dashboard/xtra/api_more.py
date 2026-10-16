@@ -58,6 +58,39 @@ async def fix_apply(request):
                "restart_needed": any(v == "queued" for v in packs.values())})
 
 
+@routes.post("/api/fix/use")
+async def fix_use(request):
+    """Use a model the user picked for a missing file: download it under the name the workflow
+    expects and remember the match in the library, so the workflow resolves next time.
+    Body: {filename, category, version_id + file_id? (Civitai) or url, remember?: true}."""
+    b = await _body(request)
+    st = _store(request)
+    settings = st.settings()
+    filename, category = b["filename"], b.get("category")
+    if b.get("version_id"):
+        cand = await asyncio.to_thread(sources.civitai_version, b["version_id"], settings.get("civitai_token"),
+                                       b.get("file_id"), bool(settings.get("show_nsfw")))
+    elif b.get("url"):
+        cand = await asyncio.to_thread(sources.resolve, b["url"], settings)
+        if cand.get("source") == "hf-repo":
+            raise ValueError("That is a repository link: pick one of its files")
+    else:
+        raise ValueError("Pick a model (version_id or url)")
+    cand = dict(cand, filename=filename, category=category or cand.get("category"))
+    item = None
+    if b.get("remember", True):
+        item = next((i for i in st.all("library") if i.get("url") == cand["url"]), None)
+        if item:
+            if filename.lower() != (item.get("filename") or "").lower() and filename not in item.get("aliases", []):
+                item["aliases"] = item.get("aliases", []) + [filename]
+        else:
+            item = sources.library_item(cand, {"notes": f"Matched to {filename} by the fixer"})
+        await asyncio.to_thread(st.put, "library", item)
+        bus.publish("library", {"changed": [item["id"]]})
+    task = _dl(request).add(dict(cand, library_id=item["id"]) if item else cand)
+    return ok({"task": task, "library_id": item and item["id"]})
+
+
 @routes.get("/api/fix/packs/status")
 async def fix_packs_status(request):
     return ok(await asyncio.to_thread(fixer.manager_queue_status))

@@ -38,8 +38,8 @@ jobs:
         run: |
           for f in provis.sh lib/*.sh; do bash -n "$f"; done
           python -m py_compile tools/xtra.py lib/tune.py comfyui_ext/__init__.py dashboard/server.py dashboard/xtra/*.py
-      - name: CLI tests (offline)
-        run: python -m unittest tests/test_xtra_cli.py
+      - name: Offline tests (CLI, fixer matching)
+        run: XTRA_WORKSPACE="$RUNNER_TEMP/unit" python -m unittest tests/test_xtra_cli.py tests/test_fixer.py
       - name: Start the dashboard
         env:
           XTRA_WORKSPACE: ${{ runner.temp }}/ws
