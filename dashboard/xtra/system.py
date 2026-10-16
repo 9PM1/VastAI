@@ -82,7 +82,8 @@ async def vast_instance():
         _vast_cache["data"] = {"id": inst.get("id"), "dph": inst.get("dph_total"), "gpu": inst.get("gpu_name"),
                                "start": start, "uptime": int(time.time() - start) if start else None,
                                "spent": round((time.time() - start) / 3600 * (inst.get("dph_total") or 0), 3) if start else None,
-                               "label": inst.get("label")}
+                               "label": inst.get("label"), "machine_id": inst.get("machine_id"),
+                               "dlperf": inst.get("dlperf"), "gpu_mem_bw": inst.get("gpu_mem_bw")}
     except Exception as exc:
         log.info("Vast API lookup failed: %s", exc)
         _vast_cache["data"] = None

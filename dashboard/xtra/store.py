@@ -23,7 +23,7 @@ import time
 from . import config
 from .util import log, now
 
-COLLECTIONS = ("settings", "library", "bundles", "stars", "meta", "benchmarks")
+COLLECTIONS = ("settings", "library", "bundles", "stars", "meta", "benchmarks", "hosts")
 SCHEMA_VERSION = 2
 SYNC_INTERVAL = 15
 SECRET_KEYS = {"hf_token", "civitai_token", "discord_webhook"}
