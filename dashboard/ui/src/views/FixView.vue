@@ -91,6 +91,13 @@ const nodes = computed(() => plan.value?.nodes || [])
 const installablePacks = computed(() => [...new Set(nodes.value.filter((n) => n.pack && !['enabled', 'installed'].includes(n.pack.state)).map((n) => n.pack.id))])
 const need = computed(() => fixableModels.value.reduce((s, m) => s + (m.fix.kind === 'download' ? m.fix.size || 0 : 0), 0))
 const fits = computed(() => !plan.value?.summary?.disk_free || need.value < plan.value.summary.disk_free * 0.97)
+// Minimum: what the workflow needs as it's set up. Maximum: also the models of its switched-off nodes.
+const sizeRange = computed(() => {
+  const s = plan.value?.summary
+  if (!s || !s.size_max) return null
+  const free = s.disk_free || 0
+  return { min: s.size_min, max: s.size_max, free, minFits: !free || s.size_min < free * 0.97, maxFits: !free || s.size_max < free * 0.97, unknown: s.size_unknown }
+})
 const allGood = computed(() => plan.value && !requiredModels.value.length && !nodes.value.length)
 const taskFor = (m) => app.downloadList.find((t) => (t.filename === m.name || t.filename === m.filename) && t.category === m.category && !['cancelled'].includes(t.status))
 const folderOf = (m) => m.name !== m.filename ? m.name.slice(0, -m.filename.length) : ''
@@ -226,6 +233,23 @@ const addOpen = ref(false)
               <HardDrive class="size-3.5" /> {{ bytes(plan.summary.disk_free) }} free{{ fits ? '' : ' — not enough space' }}
             </span>
           </div>
+          <dl v-if="sizeRange" class="mt-3 grid max-w-md grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs">
+            <dt class="text-fg2">Minimum</dt>
+            <dd :class="sizeRange.minFits ? 'text-fg' : 'text-danger-hover'">
+              {{ bytes(sizeRange.min) }} <span class="text-muted">to run it as set up{{ sizeRange.min > need ? ', incl. models you pick' : '' }}</span>
+            </dd>
+            <template v-if="sizeRange.max > sizeRange.min">
+              <dt class="text-fg2">Maximum</dt>
+              <dd :class="sizeRange.maxFits ? 'text-fg' : 'text-warn'">
+                {{ bytes(sizeRange.max) }} <span class="text-muted">with the switched-off nodes too</span>
+              </dd>
+            </template>
+            <template v-if="sizeRange.free">
+              <dt class="text-fg2">Free disk</dt>
+              <dd class="text-fg">{{ bytes(sizeRange.free) }}<span v-if="!sizeRange.maxFits && sizeRange.minFits" class="text-muted"> · enough for the minimum only</span></dd>
+            </template>
+            <dd v-if="sizeRange.unknown" class="col-span-2 text-muted">{{ sizeRange.unknown }} file size(s) unknown, not counted.</dd>
+          </dl>
           <div v-if="planTasks.length" class="mt-3">
             <div class="mb-1 flex justify-between text-xs text-fg2 tabular">
               <span>{{ downloading.length ? `Downloading ${downloading.length} model(s)` : 'Downloads finished' }}</span>

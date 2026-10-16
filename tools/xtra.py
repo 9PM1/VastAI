@@ -272,7 +272,7 @@ def forget_bad(which):
 MODEL_EXT = (".safetensors", ".sft", ".gguf", ".ckpt", ".pt", ".pth", ".bin")
 # Billions of parameters for model families whose files don't say it.
 FAMILIES = [
-    ("flux2", 32), ("flux.2", 32), ("qwen_image", 20), ("qwen-image", 20), ("hidream", 17), ("hunyuan", 13),
+    ("minimax_h3", 21), ("minimaxh3", 21), ("flux2", 32), ("flux.2", 32), ("qwen_image", 20), ("qwen-image", 20), ("hidream", 17), ("hunyuan", 13),
     ("ltx", 13), ("wan2", 14), ("wan_2", 14), ("cosmos", 14), ("flux", 12), ("krea", 12), ("chroma", 8.9),
     ("sd3.5_large", 8), ("sd3.5l", 8), ("auraflow", 6.8), ("z_image", 6), ("sd3", 2.5), ("lumina", 2.6),
     ("umt5", 5.7), ("t5xxl", 4.8), ("t5", 4.8), ("llama", 8), ("clip_g", 0.7), ("clip_l", 0.12),
@@ -295,7 +295,8 @@ def _bytes_per_param(n):
 
 def _kind(node_type, directory=""):
     t = f"{node_type} {directory}".lower()
-    for key, kind in (("lora", "lora"), ("vae", "vae"), ("controlnet", "controlnet"), ("upscale", "upscaler"),
+    for key, kind in (("interpolat", "interpolation"), ("preview", "vae"), ("lora", "lora"), ("vae", "vae"),
+                      ("controlnet", "controlnet"), ("upscale", "upscaler"),
                       ("clip_vision", "other"), ("clip", "text"), ("text_encoder", "text"), ("t5", "text"),
                       ("checkpoint", "checkpoint"), ("unet", "diffusion"), ("diffusion", "diffusion"), ("gguf", "diffusion"),
                       ("modelloader", "diffusion")):
@@ -307,7 +308,7 @@ def _kind(node_type, directory=""):
 def estimate_size_gb(name, kind):
     """Rough file size from the name: parameter count (from the name or the model family) x dtype."""
     n = name.lower().rsplit("/", 1)[-1]
-    fixed = {"lora": 0.3, "vae": 0.3, "upscaler": 0.07, "controlnet": 2.5}
+    fixed = {"lora": 0.3, "vae": 0.3, "upscaler": 0.07, "controlnet": 2.5, "interpolation": 0.05}
     if kind in fixed:
         return fixed[kind], "typical size"
     m = re.search(r"(?<![a-z\d.])(\d+(?:\.\d+)?)b(?![a-z])", n)
@@ -341,29 +342,77 @@ def _remote_size_gb(url):
         return None
 
 
+def _subgraph_values(workflow):
+    """Values a subgraph panel passes into its inner nodes: {(subgraph_id, node_id): [values]}, and
+    {subgraph_id: instance mode}. They replace the inner nodes' own model names."""
+    defs = {g.get("id"): g for g in ((workflow.get("definitions") or {}).get("subgraphs") or [])}
+    passed, modes = {}, {}
+    for n in workflow.get("nodes") or []:
+        g = defs.get(n.get("type"))
+        if not g:
+            continue
+        modes[g["id"]] = n.get("mode") or 0
+        inputs = [i for i in g.get("inputs") or [] if i.get("type") in ("COMBO", "INT", "FLOAT", "BOOLEAN", "STRING")]
+        values = n.get("widgets_values")
+        if not isinstance(values, list) or len(values) != len(inputs):
+            continue
+        links = {l.get("id"): l for l in g.get("links") or [] if isinstance(l, dict)}
+        for inp, value in zip(inputs, values):
+            for lid in inp.get("linkIds") or []:
+                if lid in links and isinstance(value, str):
+                    passed.setdefault((g["id"], links[lid].get("target_id")), []).append(value)
+    return passed, modes
+
+
 def workflow_needs(workflow, sizes=None):
-    """Models a workflow loads, their (estimated) sizes, the VRAM it needs and the download size."""
+    """Models a workflow loads, their (estimated) sizes, the VRAM it needs and the download size:
+    the minimum to run it as set up, and the maximum with its switched-off (muted/bypassed) nodes."""
     files = {}
 
-    def add(name, kind, url=""):
+    def add(name, kind, url="", active=True):
         if not isinstance(name, str) or not name.lower().endswith(MODEL_EXT):
             return
-        f = files.setdefault(name, {"name": name, "kind": kind, "url": url})
+        f = files.setdefault(name, {"name": name, "kind": kind, "url": url, "active": False})
         if f["kind"] == "other":
             f["kind"] = kind
         f["url"] = f["url"] or url
+        f["active"] = f["active"] or active
 
-    graphs = [workflow] + list(((workflow.get("definitions") or {}).get("subgraphs")) or []) if isinstance(workflow.get("nodes"), list) else []
+    ui = isinstance(workflow.get("nodes"), list)
+    defs = ((workflow.get("definitions") or {}).get("subgraphs")) or [] if ui else []
+    sub_ids = {g.get("id") for g in defs}
+    passed, sub_modes = _subgraph_values(workflow) if ui else ({}, {})
+    graphs = [(None, workflow)] + [(g.get("id"), g) for g in defs] if ui else []
     node_types = []
-    for g in graphs:
+    for gid, g in graphs:
         for n in g.get("nodes") or []:
             t = n.get("type") or ""
+            if t in sub_ids:
+                continue  # its values belong to the inner nodes
             node_types.append(t)
+            active = (n.get("mode") or 0) not in (2, 4) and sub_modes.get(gid, 0) not in (2, 4)
             for m in (n.get("properties") or {}).get("models") or []:
-                add(m.get("name"), _kind(t, m.get("directory") or ""), m.get("url") or "")
+                # Templates list the models a node *can* use; only its widget value is what it loads.
+                add(m.get("name"), _kind(t, m.get("directory") or ""), m.get("url") or "", active=False)
             vals = n.get("widgets_values")
-            for v in (vals.values() if isinstance(vals, dict) else vals or []):
-                add(v, _kind(t))
+            vals = list(vals.values()) if isinstance(vals, dict) else (vals or [])
+            if passed.get((gid, n.get("id"))):
+                own = [v for v in vals if isinstance(v, str) and v.lower().endswith(MODEL_EXT)]
+                vals = passed[(gid, n.get("id"))] if len(own) <= 1 else vals + passed[(gid, n.get("id"))]
+            for v in vals:
+                add(v, _kind(t), active=active)
+    # A template link for a file the widgets also use is the same file: match by base name.
+    by_base = {}
+    for f in files.values():
+        by_base.setdefault(f["name"].rsplit("/", 1)[-1].lower(), []).append(f)
+    for group in by_base.values():
+        if len(group) > 1:
+            keep = max(group, key=lambda f: ("/" in f["name"], f["active"]))
+            for f in group:
+                if f is not keep:
+                    keep["url"] = keep["url"] or f["url"]
+                    keep["active"] = keep["active"] or f["active"]
+                    files.pop(f["name"], None)
     if not graphs:  # API format
         for n in workflow.values():
             if isinstance(n, dict) and n.get("class_type"):
@@ -378,7 +427,8 @@ def workflow_needs(workflow, sizes=None):
             f["gb"], f["how"] = estimate_size_gb(f["name"], f["kind"])
     blob = " ".join(list(files) + node_types).lower()
     video = any(h in blob for h in VIDEO_HINTS)
-    known = [f for f in files.values() if f["gb"]]
+    every = [f for f in files.values() if f["gb"]]
+    known = [f for f in every if f["active"]] or every  # VRAM from what actually runs
     main = max((f["gb"] for f in known if f["kind"] in ("diffusion", "checkpoint")), default=max((f["gb"] for f in known), default=0))
     text = max((f["gb"] for f in known if f["kind"] == "text"), default=0)
     extras = sum(f["gb"] for f in known if f["kind"] in ("vae", "lora", "controlnet"))
@@ -392,7 +442,8 @@ def workflow_needs(workflow, sizes=None):
         "video": video,
         "min_vram_gb": vram_tier(minimum) if main else None,
         "comfortable_vram_gb": vram_tier(comfortable) if main else None,
-        "download_gb": round(sum(f["gb"] for f in known), 1),
+        "download_gb": round(sum(f["gb"] for f in every if f["active"]), 1),  # minimum: as set up
+        "download_gb_max": round(sum(f["gb"] for f in every), 1),  # with the switched-off nodes too
         "unknown": [f["name"] for f in files.values() if not f["gb"]],
     }
 
@@ -502,10 +553,15 @@ def apply_workflow(a):
 
 
 def describe_needs(needs):
-    lines = [f"  {f['name']:<52} {f['kind']:<11} " + (f"{f['gb']:>6.1f} GB  ({f['how']})" if f["gb"] else "     ?  (unknown size)")
-             for f in needs["files"]]
+    short = lambda n, w=52: n if len(n) <= w else "…" + n[-(w - 1):]
+    lines = [f"  {'' if f['active'] else '(off) '}{short(f['name']):<52} {f['kind']:<13} "
+             + (f"{f['gb']:>6.1f} GB  ({f['how']})" if f["gb"] else "     ?  (unknown size)")
+             for f in sorted(needs["files"], key=lambda f: not f["active"])]
     lines.append(f"  Needs at least {needs['min_vram_gb']} GB VRAM ({needs['comfortable_vram_gb']} GB to keep everything loaded)"
-                 f"{', video workload' if needs['video'] else ''}; downloads about {needs['download_gb']:.0f} GB.")
+                 f"{', video workload' if needs['video'] else ''}.")
+    lines.append(f"  Downloads: minimum {needs['download_gb']:.0f} GB to run it as set up"
+                 + (f", maximum {needs['download_gb_max']:.0f} GB with the switched-off (off) nodes too."
+                    if needs["download_gb_max"] > needs["download_gb"] else "."))
     if needs["unknown"]:
         lines.append("  Sizes of " + ", ".join(needs["unknown"]) + " are unknown; pass --min-vram if the guess is off.")
     return "\n".join(lines)
@@ -800,6 +856,11 @@ def cmd_fix(a):
     s = plan["summary"]
     print(f"{s['models_missing']} missing model(s) ({s['models_fixable']} fixable, {s['download_bytes'] / 1e9:.1f} GB), "
           f"{s.get('models_optional', 0)} optional (switched-off nodes), {s['nodes_missing']} missing node type(s)")
+    if s.get("size_max"):
+        free = f", {s['disk_free'] / 1e9:.0f} GB free" if s.get("disk_free") else ""
+        print(f"Downloads: minimum {s['size_min'] / 1e9:.1f} GB to run it as set up (picks included), "
+              f"maximum {s['size_max'] / 1e9:.1f} GB with the switched-off nodes too{free}"
+              + (f"; {s['size_unknown']} size(s) unknown" if s.get("size_unknown") else ""))
     for m in sorted(plan["models"], key=lambda m: bool(m.get("optional"))):
         if m["status"] == "installed":
             continue

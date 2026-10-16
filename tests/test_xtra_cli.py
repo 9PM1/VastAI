@@ -49,6 +49,19 @@ class WorkflowNeeds(unittest.TestCase):
         self.assertEqual(xtra.estimate_size_gb("v1-5-pruned-emaonly-fp16.safetensors", "checkpoint")[0], 2.1)
         self.assertIsNone(xtra.estimate_size_gb("mystery.safetensors", "other")[0])
 
+    def test_minimum_and_maximum(self):
+        n = xtra.workflow_needs({"nodes": [
+            {"type": "UNETLoader", "widgets_values": ["MiniMaxH3/model_14b_fp8.safetensors"]},
+            {"type": "UpscaleModelLoader", "mode": 4, "widgets_values": ["2x-AnimeSharpV4_RCAN.safetensors"]},
+            {"type": "UNETLoader", "widgets_values": ["MiniMaxH3/model_14b_fp8.safetensors"],
+             "properties": {"models": [{"name": "model_14b_fp8.safetensors", "url": "https://x/model_14b_fp8.safetensors", "directory": "diffusion_models"},
+                                       {"name": "other_20b_fp8.safetensors", "url": "https://x/o", "directory": "diffusion_models"}]}}]}, sizes={})
+        names = {f["name"]: f["active"] for f in n["files"]}
+        self.assertEqual(names, {"MiniMaxH3/model_14b_fp8.safetensors": True, "2x-AnimeSharpV4_RCAN.safetensors": False,
+                                 "other_20b_fp8.safetensors": False})
+        self.assertEqual(n["download_gb"], 14.0)
+        self.assertAlmostEqual(n["download_gb_max"], 14.0 + 0.07 + 20.0, delta=0.1)
+
     def test_api_format_and_exact_sizes(self):
         wf = {"1": {"class_type": "UNETLoader", "inputs": {"unet_name": "x.safetensors"}},
               "2": {"class_type": "KSampler", "inputs": {"seed": 1}}}

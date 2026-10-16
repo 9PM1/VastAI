@@ -241,6 +241,9 @@ class WorkflowHints(unittest.TestCase):
         self.assertEqual(rife["origin"], "workflow-note:Comfy-Org/frame_interpolation")
         self.assertEqual(plan["summary"]["models_optional"], 2)  # rife + the overridden fl2va
         self.assertEqual(plan["summary"]["unresolved"], ["dasiwa_turbo_int8.safetensors"])
+        s = plan["summary"]
+        self.assertEqual(s["size_min"], (vae["fix"]["size"] or 0) + (by["taeh3.safetensors"]["fix"]["size"] or 0))
+        self.assertEqual(s["size_max"], s["size_min"] + 21_000_000 + (by["minimax_h3_fl2va_pruned_int8_convrot.safetensors"]["fix"] or {}).get("size", 0))
         self.assertEqual(plan["summary"]["download_bytes"], 0 + (vae["fix"]["size"] or 0) + (by["taeh3.safetensors"]["fix"]["size"] or 0))
 
     def test_pack_from_notes(self):
