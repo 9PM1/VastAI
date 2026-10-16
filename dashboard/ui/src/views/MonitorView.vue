@@ -8,6 +8,8 @@ import Btn from '../components/ui/Btn.vue'
 import Bar from '../components/ui/Bar.vue'
 import Sparkline from '../components/Sparkline.vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
+import HealthCard from '../components/HealthCard.vue'
+import BenchmarkCard from '../components/BenchmarkCard.vue'
 
 const app = useApp()
 const s = computed(() => app.system)
@@ -95,6 +97,10 @@ async function act(name, path, ok) {
               <div class="flex items-center gap-1.5"><Clock class="size-3.5" /><dt class="sr-only">Uptime</dt><dd class="tabular">Up {{ duration(s.vast.uptime) }}</dd></div>
               <div class="flex items-center gap-1.5"><CircleDollarSign class="size-3.5" /><dt class="sr-only">Spent</dt><dd class="tabular">${{ s.vast.spent?.toFixed(2) }} so far</dd></div>
             </dl>
+            <p class="mt-3 text-xs text-fg2">
+              <template v-if="app.autostop?.enabled">Auto-stop after {{ app.autostop.minutes }} min idle<span v-if="app.autostop.idle_seconds > 60"> · idle {{ Math.floor(app.autostop.idle_seconds / 60) }} min</span></template>
+              <template v-else>Auto-stop is off. <a href="#/settings?section=autostop" class="text-primary-hover hover:underline">Turn it on</a></template>
+            </p>
           </template>
           <p v-else class="text-xs text-fg2">Cost and uptime appear when running on a Vast.ai instance.</p>
         </section>
@@ -117,6 +123,11 @@ async function act(name, path, ok) {
           <p class="my-1 text-xl font-semibold tabular">{{ bytes(s.disk.free) }} <span class="text-xs font-normal text-fg2">free of {{ bytes(s.disk.total, 0) }}</span></p>
           <Bar :value="pct(s.disk.used, s.disk.total)" :tone="tone(pct(s.disk.used, s.disk.total))" label="Disk usage" />
         </section>
+      </div>
+
+      <div class="grid gap-4 lg:grid-cols-2">
+        <HealthCard />
+        <BenchmarkCard />
       </div>
     </template>
     <ConfirmDialog v-model:open="restartOpen" title="Restart ComfyUI?" text="Running and queued jobs will be lost. ComfyUI is back in about 20–60 seconds." confirm="Restart" :loading="busy === 'restart'"

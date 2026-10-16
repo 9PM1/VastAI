@@ -9,25 +9,71 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from aiohttp import web  # noqa: E402
 
-from xtra import __version__, api, config, models, notify, store, system  # noqa: E402
+from xtra import __version__, api, api_more, autostop, backup, config, fixer, health, library, models, notify, store, system  # noqa: E402
 from xtra.downloads import DownloadManager  # noqa: E402
 from xtra.events import bus  # noqa: E402
 from xtra.util import human_size, log  # noqa: E402
 
 
 def auto_install(app):
-    """Queue every library item marked auto-install that is not on disk yet."""
+    """Queue library items marked auto-install, plus every item in auto-install bundles
+    (flagged in the UI, or named in the XTRA_BUNDLES env var), that are not on disk yet."""
+    st = app["store"]
+    wanted = {b.strip().lower() for b in os.environ.get("XTRA_BUNDLES", "").split(",") if b.strip()}
+    bundle_ids = {b["id"] for b in st.all("bundles")
+                  if b.get("auto_install") or b["id"].lower() in wanted or (b.get("name") or "").lower() in wanted}
     idx = models.index()
     queued = 0
-    for item in app["store"].all("library"):
-        if item.get("auto_install") and item.get("category") not in idx.get((item.get("filename") or "").lower(), []):
-            try:
-                app["downloads"].add(api._download_spec(item), auto=True)
-                queued += 1
-            except Exception as exc:
-                log.warning("Auto-install of %s skipped: %s", item.get("name"), exc)
+    for item in st.all("library"):
+        if not (item.get("auto_install") or bundle_ids & set(item.get("bundle_ids") or [])):
+            continue
+        if item.get("category") in idx.get((item.get("filename") or "").lower(), []):
+            continue
+        try:
+            app["downloads"].add(api._download_spec(item), auto=True)
+            queued += 1
+        except Exception as exc:
+            log.warning("Auto-install of %s skipped: %s", item.get("name"), exc)
     if queued:
         log.info("Auto-install queued %d model(s)", queued)
+
+
+async def boot_tasks(app):
+    """Slow one-off work after startup: host health (once per boot), library metadata, HF index."""
+    await asyncio.sleep(20)
+    try:
+        import psutil
+        cached = health.cached()
+        if not cached or cached.get("at", 0) < psutil.Process(1).create_time():
+            await api_more.run_health(app, notify_warnings=True)
+    except Exception as exc:
+        log.warning("Host health check failed: %s", exc)
+    try:
+        result = await asyncio.to_thread(library.refresh, app["store"], None, True)
+        if result["updated"] or result["failed"]:
+            bus.publish("library", {"refreshed": True})
+    except Exception as exc:
+        log.warning("Library refresh failed: %s", exc)
+    fixer.warm_hf_index()
+
+
+def schedule_backup(app, loop):
+    """Debounced auto-backup after ComfyUI finishes a job (if enabled)."""
+    def trigger():
+        st = app["store"]
+        if not (st.setting("backup_auto") and st.setting("backup_repo") and st.setting("hf_token")):
+            return
+        if app.get("backup_handle"):
+            app["backup_handle"].cancel()
+        app["backup_handle"] = loop.call_later(60, lambda: asyncio.ensure_future(asyncio.to_thread(_backup_quietly, st)))
+    return lambda: loop.call_soon_threadsafe(trigger)
+
+
+def _backup_quietly(st):
+    try:
+        backup.run(st, "auto")
+    except Exception as exc:
+        log.warning("Auto-backup failed: %s", exc)
 
 
 async def on_startup(app):
@@ -35,7 +81,9 @@ async def on_startup(app):
     # The store syncs MongoDB on its own thread; hop back to the loop to notify browsers.
     app["store"].on_change = lambda colls: loop.call_soon_threadsafe(bus.publish, "data", {"collections": sorted(colls)})
     app["downloads"].start()
-    app["bg"] = [asyncio.create_task(system.monitor_loop()), asyncio.create_task(system.comfy_ws_loop())]
+    system.on_job_done = schedule_backup(app, loop)
+    app["bg"] = [asyncio.create_task(system.monitor_loop()), asyncio.create_task(system.comfy_ws_loop()),
+                 asyncio.create_task(autostop.loop(app["store"], app["downloads"])), asyncio.create_task(boot_tasks(app))]
     auto_install(app)
     st = app["store"]
     disk = (await system.snapshot())["disk"]
@@ -67,7 +115,8 @@ def make_app():
     app = web.Application(middlewares=[api.errors], client_max_size=64 * 1024 * 1024)
     app["store"] = store.init()
     app["downloads"] = DownloadManager(app["store"])
-    app.add_routes(api.routes)
+    app.add_routes(api_more.routes)
+    app.add_routes(api.routes)  # last: its catch-all serves the web UI
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
     return app

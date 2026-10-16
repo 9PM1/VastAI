@@ -14,6 +14,7 @@ from .util import log
 
 _vast_cache = {"at": 0.0, "data": None}
 _comfy_state = {"connected": False, "queue_remaining": 0, "running": None, "progress": None, "last_error": None}
+on_job_done = None  # callback set by the server (e.g. auto-backup); called when a prompt finishes
 
 
 async def _run(*cmd, timeout=5):
@@ -137,6 +138,8 @@ async def comfy_ws_loop():
                         queue = ((data.get("status") or {}).get("exec_info") or {}).get("queue_remaining", 0)
                         if queue < _comfy_state["queue_remaining"]:
                             bus.publish("outputs", {})  # a prompt finished
+                            if on_job_done:
+                                on_job_done()
                         _comfy_state["queue_remaining"] = queue
                         if queue == 0:
                             _comfy_state.update(running=None, progress=None)

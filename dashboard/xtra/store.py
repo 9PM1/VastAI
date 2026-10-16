@@ -5,6 +5,7 @@ Collections (schema v2, same names in MongoDB and SQLite):
   library   saved models (v1 "favorites"), see sources.library_item()
   bundles   named groups of library items (v1 "groups")
   stars     starred gallery files {id: <relative path>}
+  benchmarks  GPU value benchmark results (see bench.py)
   meta      {id: "schema", version}
 
 Reads and writes only touch SQLite, so nothing a user does waits on the
@@ -22,7 +23,7 @@ import time
 from . import config
 from .util import log, now
 
-COLLECTIONS = ("settings", "library", "bundles", "stars", "meta")
+COLLECTIONS = ("settings", "library", "bundles", "stars", "meta", "benchmarks")
 SCHEMA_VERSION = 2
 SYNC_INTERVAL = 15
 SECRET_KEYS = {"hf_token", "civitai_token", "discord_webhook"}
@@ -34,6 +35,9 @@ DEFAULT_SETTINGS = {
     "verify_hashes": True,
     "show_nsfw": False,
     "notify_downloads": True,
+    "auto_stop_minutes": 0,   # 0 = never
+    "backup_repo": "",        # Hugging Face dataset, e.g. "you/comfy-outputs"
+    "backup_auto": False,     # back up after each finished ComfyUI job
 }
 
 

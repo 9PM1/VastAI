@@ -16,9 +16,32 @@ retry 5 apt-get install -y --no-install-recommends aria2 ca-certificates curl jq
 retry 5 "$PYTHON_BIN" -m pip install --no-cache-dir -U certifi 'pymongo[srv]'
 retry 5 "$PYTHON_BIN" -m pip install --no-cache-dir huggingface_hub hf_xet
 
-for folder in audio_encoders background_removal checkpoints ckpt clip clip_vision configs controlnet detection diffusers diffusion_models embeddings frame_interpolation geometry_estimation gligen hypernetworks latent_upscale_models loras model_patches optical_flow photomaker style_models text_encoders unet upscale_models vae vae_approx; do
+MODEL_FOLDERS="audio_encoders background_removal checkpoints ckpt clip clip_vision configs controlnet detection diffusers diffusion_models embeddings frame_interpolation geometry_estimation gligen hypernetworks latent_upscale_models loras model_patches optical_flow photomaker style_models text_encoders unet upscale_models vae vae_approx"
+for folder in $MODEL_FOLDERS; do
   mkdir -p "$COMFY_BASE/$folder"
 done
+
+# Keep models on a Vast volume (XTRA_MODEL_VOLUME = its mount path) so they survive
+# destroying the instance: each model folder becomes a link into the volume, and
+# anything already in it (e.g. the image's bundled SD 1.5) is moved over first.
+if [[ -n "${XTRA_MODEL_VOLUME:-}" ]]; then
+  if [[ -d "$XTRA_MODEL_VOLUME" ]]; then
+    for folder in $MODEL_FOLDERS; do
+      src="$COMFY_BASE/$folder" dst="$XTRA_MODEL_VOLUME/models/$folder"
+      # Leave aliases alone (the image links ckpt -> checkpoints); they follow their target.
+      [[ -L "$src" && "$(readlink "$src")" != "$dst" ]] && continue
+      mkdir -p "$dst"
+      if [[ -d "$src" && ! -L "$src" ]]; then
+        find "$src" -mindepth 1 -maxdepth 1 -exec mv -n {} "$dst"/ \;
+        rm -rf "$src"
+      fi
+      ln -sfn "$dst" "$src"
+    done
+    log "Model folders live on the volume at $XTRA_MODEL_VOLUME/models ($(du -sh "$XTRA_MODEL_VOLUME/models" 2>/dev/null | cut -f1) already there)"
+  else
+    log "WARN: XTRA_MODEL_VOLUME=$XTRA_MODEL_VOLUME is not mounted; models stay on the instance disk"
+  fi
+fi
 
 # Persist only for the supervisor; chmod keeps tokens private from other users.
 {

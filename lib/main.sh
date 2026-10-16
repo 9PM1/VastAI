@@ -14,7 +14,9 @@ log "Starting Comfy-Xtra provisioning (${XTRA_REF:-unknown ref})"
 log "Python: $PYTHON_BIN"
 send_discord "⚙️ Provisioning Started" "Comfy-Xtra setup started on \`$(hostname)\`." 3447003
 
+bash "$XTRA_DIR/lib/version.sh" || true
 . "$XTRA_DIR/lib/setup.sh"
+. "$XTRA_DIR/lib/extension.sh"
 # Start the dashboard first so auto-install favorites download while the
 # speed boost installs and benchmarks.
 . "$XTRA_DIR/lib/service.sh"

@@ -1,8 +1,8 @@
 <script setup>
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import {
   Plus, Search, Download, Check, Pencil, Trash2, ExternalLink, Copy, RefreshCw, Eraser, Library as LibraryIcon,
-  FolderPlus, Layers, HardDrive, LoaderCircle, PackageOpen,
+  FolderPlus, Layers, HardDrive, LoaderCircle, PackageOpen, Unlink, Zap, CircleCheck,
 } from '@lucide/vue'
 import { api } from '../lib/api'
 import { bytes, pct } from '../lib/format'
@@ -25,10 +25,11 @@ import InstalledPanel from '../components/InstalledPanel.vue'
 const app = useApp()
 const tab = computed(() => route.value.query.tab === 'installed' ? 'installed' : 'saved')
 const bundle = computed(() => route.value.query.bundle || '')
-const q = ref('')
+const q = ref(route.value.query.q || '')
 const category = ref('')
 
-const addOpen = ref(false)
+const addOpen = ref(!!route.value.query.add)
+watch(() => route.value.query, (qq) => { if (qq.add) addOpen.value = true; if (qq.q !== undefined) q.value = qq.q })
 const editItem = ref(null)
 const editOpen = ref(false)
 const bundleEdit = ref(null)
@@ -53,6 +54,11 @@ const counts = computed(() => {
   }
   return c
 })
+const installedCounts = computed(() => {
+  const c = {}
+  for (const i of app.library) if (i.installed) for (const b of i.bundle_ids || []) c[b] = (c[b] || 0) + 1
+  return c
+})
 const taskFor = (item) => app.activeDownloads.find((t) => t.library_id === item.id || (t.filename === item.filename && t.category === item.category))
 const missing = computed(() => items.value.filter((i) => !i.installed && !taskFor(i)))
 const currentBundle = computed(() => app.bundleById[bundle.value])
@@ -60,10 +66,39 @@ const currentBundle = computed(() => app.bundleById[bundle.value])
 async function install(item) {
   await app.run(() => api.post(`library/${item.id}/install`), `Downloading ${item.filename}`)
 }
+// Install a bundle after checking it fits on disk.
+const diskConfirm = ref({ open: false })
+async function installBundle(id, force = false) {
+  try {
+    if (!force) {
+      const plan = await api.get(`bundles/${id}/plan`)
+      if (!plan.missing) { app.toast('Everything in this bundle is installed', 'success'); return }
+      if (!plan.fits) {
+        diskConfirm.value = { open: true, id, text: `This bundle needs ${bytes(plan.bytes_needed)} but only ${bytes(plan.disk_free)} is free. Some downloads will fail unless you free space first (On disk tab).` }
+        return
+      }
+    }
+    diskConfirm.value.open = false
+    const r = await api.post(`bundles/${id}/install`)
+    app.toast(r.queued ? `Queued ${r.queued} download(s)` : 'Everything in this bundle is installed', r.queued ? 'info' : 'success')
+  } catch (e) { app.toast(e.message, 'error') }
+}
+async function toggleBundleAuto(b) {
+  try {
+    await api.patch(`bundles/${b.id}`, { auto_install: !b.auto_install })
+    app.toast(!b.auto_install ? `${b.name} will install automatically on new instances` : `${b.name} won't auto-install any more`, 'success')
+    app.loadBundles()
+  } catch (e) { app.toast(e.message, 'error') }
+}
+const bundleMenu = (b) => [
+  { label: 'Install all', icon: Download, onSelect: () => installBundle(b.id) },
+  { label: b.auto_install ? 'Stop auto-installing' : 'Auto-install on new instances', icon: Zap, onSelect: () => toggleBundleAuto(b) },
+  { label: 'Edit', icon: Pencil, onSelect: () => { bundleEdit.value = b; bundleOpen.value = true } },
+  { label: 'Delete bundle', icon: Trash2, danger: true, onSelect: () => ask('bundle', b) },
+]
 async function installAll() {
   if (currentBundle.value) {
-    const r = await app.run(() => api.post(`bundles/${bundle.value}/install`))
-    app.toast(r.queued ? `Queued ${r.queued} download(s)` : 'Everything in this bundle is installed', r.queued ? 'info' : 'success')
+    await installBundle(bundle.value)
   } else {
     for (const i of missing.value) await api.post(`library/${i.id}/install`).catch((e) => app.toast(e.message, 'error'))
     app.toast(`Queued ${missing.value.length} download(s)`, 'info')
@@ -72,6 +107,7 @@ async function installAll() {
 function itemMenu(item) {
   return [
     { label: 'Edit', icon: Pencil, onSelect: () => { editItem.value = item; editOpen.value = true } },
+    item.source_missing && { label: 'Find replacement', icon: Search, onSelect: () => go('discover', { q: item.name.split(' - ')[0] }) },
     item.page_url && { label: 'Open model page', icon: ExternalLink, onSelect: () => window.open(item.page_url, '_blank', 'noopener') },
     item.trigger_words?.length && { label: 'Copy trigger words', icon: Copy, onSelect: () => navigator.clipboard?.writeText(item.trigger_words.join(', ')).then(() => app.toast('Copied', 'success')) },
     { separator: true },
@@ -125,13 +161,11 @@ const setBundle = (b) => go('library', { bundle: b })
         <div v-for="b in app.bundles" :key="b.id" class="group flex items-center rounded-md" :class="bundle === b.id ? 'bg-hover' : 'hover:bg-hover'">
           <button class="flex h-8 min-w-0 flex-1 items-center gap-2 px-2 text-sm" :class="bundle === b.id ? 'text-fg' : 'text-fg2'" @click="setBundle(b.id)">
             <span class="w-4 text-center">{{ b.icon }}</span> <span class="flex-1 truncate text-left">{{ b.name }}</span>
-            <span class="text-xs text-muted tabular group-hover:hidden">{{ counts[b.id] || 0 }}</span>
+            <Zap v-if="b.auto_install" class="size-3 text-warn group-hover:hidden" aria-label="Auto-installs" />
+            <CircleCheck v-if="counts[b.id] && installedCounts[b.id] === counts[b.id]" class="size-3.5 text-ok group-hover:hidden" aria-label="All installed" />
+            <span v-else class="text-xs text-muted tabular group-hover:hidden" :title="`${installedCounts[b.id] || 0} of ${counts[b.id] || 0} installed`">{{ installedCounts[b.id] || 0 }}/{{ counts[b.id] || 0 }}</span>
           </button>
-          <Menu class="hidden group-hover:inline-flex" :label="`${b.name} actions`" :items="[
-            { label: 'Install all', icon: Download, onSelect: () => { setBundle(b.id); installAll() } },
-            { label: 'Edit', icon: Pencil, onSelect: () => { bundleEdit = b; bundleOpen = true } },
-            { label: 'Delete bundle', icon: Trash2, danger: true, onSelect: () => ask('bundle', b) },
-          ]" />
+          <Menu class="hidden group-hover:inline-flex" :label="`${b.name} actions`" :items="bundleMenu(b)" />
         </div>
         <button class="flex h-8 w-full items-center gap-2 rounded-md px-2 text-sm" :class="bundle === '_none' ? 'bg-hover text-fg' : 'text-fg2 hover:bg-hover'" @click="setBundle('_none')">
           <Layers class="size-4" /> <span class="flex-1 text-left">Not in a bundle</span> <span class="text-xs text-muted tabular">{{ counts._none }}</span>
@@ -167,7 +201,7 @@ const setBundle = (b) => go('library', { bundle: b })
       <div v-if="tab === 'saved' && app.bundles.length" class="-mx-4 mb-4 flex gap-1.5 overflow-x-auto px-4 lg:hidden">
         <button class="h-7 shrink-0 rounded-full border px-3 text-xs" :class="!bundle ? 'border-primary bg-primary-soft' : 'border-subtle text-fg2'" @click="setBundle('')">All · {{ counts.all }}</button>
         <button v-for="b in app.bundles" :key="b.id" class="h-7 shrink-0 rounded-full border px-3 text-xs" :class="bundle === b.id ? 'border-primary bg-primary-soft' : 'border-subtle text-fg2'" @click="setBundle(b.id)">
-          {{ b.icon }} {{ b.name }} · {{ counts[b.id] || 0 }}
+          {{ b.icon }} {{ b.name }} · {{ installedCounts[b.id] || 0 }}/{{ counts[b.id] || 0 }}
         </button>
         <button class="h-7 shrink-0 rounded-full border border-dashed border-subtle px-3 text-xs text-primary-hover" @click="bundleEdit = null; bundleOpen = true">+ Bundle</button>
       </div>
@@ -190,7 +224,10 @@ const setBundle = (b) => go('library', { bundle: b })
             <button class="relative block text-left" :aria-label="`Edit ${item.name}`" @click="editItem = item; editOpen = true">
               <ModelThumb :src="item.preview" :mature="item.preview_mature" :category="item.category" :alt="item.name" class="aspect-[4/5] w-full">
                 <div class="absolute inset-x-0 top-0 flex justify-between p-2">
-                  <Tag class="bg-black/60 text-white backdrop-blur">{{ app.categoryLabel(item.category) }}</Tag>
+                  <span class="flex flex-wrap gap-1">
+                    <Tag class="bg-black/60 text-white backdrop-blur">{{ app.categoryLabel(item.category) }}</Tag>
+                    <Tag v-if="item.source_missing" tone="danger" class="backdrop-blur" title="This model was removed from its source; the download link no longer works"><Unlink class="size-3" /> Link dead</Tag>
+                  </span>
                   <span v-if="item.auto_install" class="rounded bg-black/60 px-1.5 text-[11px] leading-5 text-warn backdrop-blur" title="Auto-installs on new instances">auto</span>
                 </div>
               </ModelThumb>
@@ -223,6 +260,7 @@ const setBundle = (b) => go('library', { bundle: b })
     <AddModelDialog v-model:open="addOpen" />
     <ItemDialog v-model:open="editOpen" :item="editItem" />
     <BundleDialog v-model:open="bundleOpen" :bundle="bundleEdit" />
+    <ConfirmDialog v-model:open="diskConfirm.open" title="Not enough disk space" :danger="false" confirm="Install anyway" :text="diskConfirm.text" @confirm="installBundle(diskConfirm.id, true)" />
     <ConfirmDialog v-model:open="confirm.open" :title="confirm.title" :text="confirm.text" :confirm="confirm.confirm" :loading="confirm.loading" @confirm="doConfirm" />
   </div>
 </template>
