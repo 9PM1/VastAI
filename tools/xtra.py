@@ -183,9 +183,15 @@ def money(x):
 
 
 def norm_gpu(name):
-    """'NVIDIA GeForce RTX 5060 Ti' and 'RTX_5060_Ti' -> 'rtx 5060 ti'."""
-    n = re.sub(r"[_\s]+", " ", (name or "").lower())
-    return re.sub(r"\b(nvidia|geforce)\b", "", n).strip()
+    """Vast's name and the driver's name for the same card -> one key, e.g. 'NVIDIA GeForce RTX 5060 Ti'
+    and 'RTX_5060_Ti' -> 'rtx 5060 ti'; 'NVIDIA RTX PRO 4000 Blackwell' -> 'rtx pro 4000';
+    'NVIDIA RTX 6000 Ada Generation' -> 'rtx 6000ada'; 'NVIDIA A100-SXM4-80GB' -> 'a100 sxm4'."""
+    n = re.sub(r"[_\-\s]+", " ", (name or "").lower())
+    n = re.sub(r"\b(nvidia|geforce|blackwell|generation|edition|workstation)\b|\b\d+ ?gb\b", " ", n)
+    n = re.sub(r"\bsuper\b", "s", n)
+    n = re.sub(r"(\d) (s|ada)\b", r"\1\2", n)  # '4080 s' -> '4080s', '6000 ada' -> '6000ada'
+    n = re.sub(r"\s+", " ", n).strip()
+    return {"rtx pro 6000 max q": "rtx pro 6000 max-q", "rtx 4070 ti s": "rtx 4070 ti super"}.get(n, n)
 
 
 # ---- shared data: your benchmarks and host verdicts (MongoDB, else a running instance) --------

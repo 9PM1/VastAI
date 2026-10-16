@@ -100,6 +100,18 @@ class Ranking(unittest.TestCase):
         self.assertEqual(hidden["bad"], 1)
 
 
+class GpuNames(unittest.TestCase):
+    def test_driver_and_vast_names_match(self):
+        pairs = [("NVIDIA RTX PRO 4000 Blackwell", "RTX PRO 4000"), ("NVIDIA GeForce RTX 5060 Ti", "RTX_5060_Ti"),
+                 ("NVIDIA RTX 6000 Ada Generation", "RTX 6000Ada"), ("NVIDIA GeForce RTX 4080 SUPER", "RTX 4080S"),
+                 ("NVIDIA A100-SXM4-80GB", "A100 SXM4"),
+                 ("NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition", "RTX PRO 6000 Max-Q")]
+        for driver, vast_name in pairs:
+            self.assertEqual(xtra.norm_gpu(driver), xtra.norm_gpu(vast_name), driver)
+        self.assertIn(xtra.norm_gpu("RTX PRO 6000 Max-Q"), xtra.RELATIVE_SPEED)
+        self.assertIn(xtra.norm_gpu("RTX 4070 Ti SUPER"), xtra.RELATIVE_SPEED)
+
+
 class BadHostMemory(unittest.TestCase):
     def test_remember_expire_and_forget(self):
         xtra.save_json(xtra.BAD_HOSTS_FILE, {"old": {"at": time.time() - 40 * 86400}})
