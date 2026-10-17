@@ -1,9 +1,9 @@
 {
-  "name": "comfy-xtra-ui",
+  "name": "comfortable-ui",
   "private": true,
   "version": "2.0.0",
   "type": "module",
-  "description": "Comfy-Xtra dashboard UI. Built into ../web, which the backend serves.",
+  "description": "Comfortable dashboard UI. Built into ../web, which the backend serves.",
   "scripts": {
     "dev": "vite",
     "build": "vite build"

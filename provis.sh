@@ -1,5 +1,5 @@
 #!/bin/sh
-# Comfy-Xtra entry point for Vast's PROVISIONING_SCRIPT. Keep this file LF-only.
+# Comfortable entry point for Vast's PROVISIONING_SCRIPT. Keep this file LF-only.
 # Downloads this repo at XTRA_REF into /opt/comfy-xtra and runs lib/main.sh.
 # WARNING: port 17890 must be protected by your provider/firewall/reverse proxy if exposed publicly.
 #
@@ -37,12 +37,12 @@ while [ "$attempt" -le 4 ]; do
   rc=0
   fetch_repo && /bin/bash "$XTRA_DIR/lib/main.sh" || rc=$?
   if [ "$rc" -eq 0 ]; then
-    echo "Comfy-Xtra provisioning completed successfully (${XTRA_REPO}@${XTRA_REF})."
+    echo "Comfortable provisioning completed successfully (${XTRA_REPO}@${XTRA_REF})."
     echo "Dashboard authentication: disabled"
     exit 0
   fi
   if [ "$attempt" -ge 4 ]; then
-    echo "Comfy-Xtra provisioning failed after $attempt attempts (rc=$rc)." >&2
+    echo "Comfortable provisioning failed after $attempt attempts (rc=$rc)." >&2
     exit "$rc"
   fi
   echo "Provision attempt $attempt failed; self-rescheduling in ${delay}s..." >&2

@@ -1,6 +1,6 @@
-"""Comfy-Xtra inside ComfyUI.
+"""Comfortable inside ComfyUI.
 
-Adds a "Xtra" sidebar tab (the full Comfy-Xtra dashboard) and checks every
+Adds a "Comfortable" sidebar tab (the full Comfortable dashboard) and checks every
 workflow you open for missing models, node packs and misplaced files.
 
 The dashboard runs as its own service on 127.0.0.1:17890. This extension
@@ -54,6 +54,6 @@ async def xtra_proxy(request):
             await resp.write_eof()
             return resp
     except aiohttp.ClientConnectorError:
-        return web.Response(status=502, text="Comfy-Xtra dashboard is not running (supervisorctl status comfy-xtra)")
+        return web.Response(status=502, text="Comfortable dashboard is not running (supervisorctl status comfy-xtra)")
     except (ConnectionResetError, aiohttp.ClientPayloadError):
         return web.Response(status=499)

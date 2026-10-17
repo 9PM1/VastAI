@@ -1,6 +1,12 @@
-// Comfy-Xtra inside ComfyUI: an "Xtra" sidebar tab with the dashboard, an automatic
+// Comfortable inside ComfyUI: a "Comfortable" sidebar tab with the dashboard, an automatic
 // check of every workflow you open, and the auto-stop warning.
 import { app } from "../../scripts/app.js";
+
+// The sidebar icon is the Comfortable logo (shipped next to this file), drawn by a CSS class.
+const LOGO = new URL("./logo.png", import.meta.url).href;
+const iconStyle = document.createElement("style");
+iconStyle.textContent = `.comfortable-icon{display:inline-block;width:1.4rem;height:1.4rem;background:url("${LOGO}") center/contain no-repeat}`;
+document.head.appendChild(iconStyle);
 
 const BASE = "/xtra/";
 const state = { count: 0, plan: null, frame: null, timer: null, banner: null };
@@ -30,13 +36,13 @@ async function analyze(missingNodes = []) {
     if (state.count) {
       const fixable = s.models_fixable + s.nodes_fixable;
       app.extensionManager?.toast?.add({
-        severity: "warn", summary: "Comfy-Xtra",
-        detail: `${state.count} missing item(s) in this workflow` + (fixable ? `, ${fixable} can be fixed automatically` : "") + ". Open the ⚡ Xtra tab.",
+        severity: "warn", summary: "Comfortable",
+        detail: `${state.count} missing item(s) in this workflow` + (fixable ? `, ${fixable} can be fixed automatically` : "") + ". Open the Comfortable tab.",
         life: 9000,
       });
     }
   } catch (e) {
-    console.warn("[Comfy-Xtra] workflow check failed", e);
+    console.warn("[Comfortable] workflow check failed", e);
   }
 }
 
@@ -53,7 +59,7 @@ window.addEventListener("message", async (e) => {
     post({ type: "xtra:workflow", workflow: currentWorkflow(), name: app.extensionManager?.workflow?.activeWorkflow?.filename || "Current workflow" });
     if (state.plan) post({ type: "xtra:plan", plan: state.plan });
   } else if (type === "xtra:refresh-models") {
-    try { await app.refreshComboInNodes(); } catch (err) { console.warn("[Comfy-Xtra] refresh failed", err); }
+    try { await app.refreshComboInNodes(); } catch (err) { console.warn("[Comfortable] refresh failed", err); }
     scheduleAnalyze([]);
   } else if (type === "xtra:reanalyze") {
     scheduleAnalyze([]);
@@ -92,9 +98,9 @@ app.registerExtension({
   async setup() {
     app.extensionManager.registerSidebarTab({
       id: "comfy-xtra",
-      icon: "pi pi-bolt",
-      title: "Xtra",
-      tooltip: "Comfy-Xtra: fix missing models and nodes, library, downloads",
+      icon: "comfortable-icon",
+      title: "Comfortable",
+      tooltip: "Comfortable: fix missing models and nodes, library, downloads",
       iconBadge: () => (state.count ? String(state.count) : null),
       type: "custom",
       render(el) {
@@ -102,7 +108,7 @@ app.registerExtension({
         if (!state.frame) {
           state.frame = document.createElement("iframe");
           state.frame.src = `${BASE}?embed=1#/fix`;
-          state.frame.title = "Comfy-Xtra";
+          state.frame.title = "Comfortable";
           state.frame.style.cssText = "width:100%;height:100%;border:0;display:block;background:#171718";
         }
         el.style.height = "100%";

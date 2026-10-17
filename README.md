@@ -1,7 +1,11 @@
-# Comfy-Xtra for Vast.ai
+<img src="docs/logo.png" alt="Comfortable" width="160" align="right" />
 
-Provisioning for the `vastai/comfy` image: installs the Comfy-Xtra model manager
-dashboard (port 17890, exposed through the Instance Portal on 7890), a ⚡ Xtra tab inside
+# Comfortable for Vast.ai
+
+*Formerly Comfy-Xtra.*
+
+Provisioning for the `vastai/comfy` image: installs the Comfortable model manager
+dashboard (port 17890, exposed through the Instance Portal on 7890), a Comfortable tab inside
 ComfyUI, and an auto-tuned ComfyUI speed boost.
 
 Point the template's `PROVISIONING_SCRIPT` at:
@@ -13,7 +17,7 @@ https://raw.githubusercontent.com/9PM1/VastAI/refs/heads/main/provis.sh
 ## What you get
 
 - **Fixer, inside ComfyUI.** When a workflow loads, missing models and custom nodes are found and
-  a toast offers to fix them. The ⚡ Xtra sidebar tab lists each one with where it will come from
+  a toast offers to fix them. The Comfortable sidebar tab lists each one with where it will come from
   (your library, the workflow's own links, ComfyUI-Manager's model list, the Hugging Face repos of
   Comfy-Org / Kijai / city96 / QuantStack / lllyasviel, or Civitai), the download size against free
   disk, and installs node packs through ComfyUI-Manager. One click fixes everything; the model lists
@@ -45,7 +49,7 @@ https://raw.githubusercontent.com/9PM1/VastAI/refs/heads/main/provis.sh
 | `XTRA_REPO` | `9PM1/VastAI` | Repository to install from. |
 | `XTRA_BUNDLES` | | Bundle names or ids to download on boot, comma separated (in addition to bundles marked auto-install). |
 | `XTRA_MODEL_VOLUME` | | Path of a mounted Vast volume (e.g. `/mnt/models`). Model folders live there, so they survive the instance. |
-| `XTRA_COMFY_EXTENSION` | `1` | `0`: don't add the ⚡ Xtra tab and workflow checks to ComfyUI. |
+| `XTRA_COMFY_EXTENSION` | `1` | `0`: don't add the Comfortable tab and workflow checks to ComfyUI. |
 | `XTRA_HF_AUTHORS` | `Comfy-Org,Kijai,city96,QuantStack,lllyasviel` | Hugging Face accounts the fixer indexes to find missing models by filename. |
 | `SAGE_ATTENTION` | `0` | `1`: SageAttention 1. `2`: SageAttention 2 from a prebuilt wheel (seconds), else a source build (3-5 min), else falls back to 1. |
 | `XTRA_TUNE` | `1` | `0`: skip auto-tuning and use the template's `COMFYUI_ARGS` unchanged. |
@@ -84,7 +88,7 @@ the VRAM and download size from the workflow (`xtra needs workflow.json` shows t
 
 `--keep-models` creates a Vast local volume (`comfy-xtra-models`) on the first rent and links it
 afterwards; local volumes are tied to one machine. `tools/claude-skill/` is the same tool packaged
-as a Claude Code skill: copy that folder plus `tools/xtra.py` to `~/.claude/skills/comfy-xtra/`.
+as a Claude Code skill: copy that folder plus `tools/xtra.py` to `~/.claude/skills/comfortable/`.
 
 ## Layout
 
@@ -95,13 +99,13 @@ as a Claude Code skill: copy that folder plus `tools/xtra.py` to `~/.claude/skil
 | `lib/common.sh` | Shared paths, `log`, `retry`, `send_discord`. |
 | `lib/version.sh` | Records the installed commit in `/opt/comfy-xtra/VERSION`. |
 | `lib/setup.sh` | apt/pip packages, model folders (on `XTRA_MODEL_VOLUME` when set), dashboard env file. |
-| `lib/extension.sh` | Links `comfyui_ext` into ComfyUI's `custom_nodes` as `ComfyUI-Xtra`. |
+| `lib/extension.sh` | Links `comfyui_ext` into ComfyUI's `custom_nodes` as `ComfyUI-Comfortable`. |
 | `lib/service.sh` | Registers the dashboard with supervisord and waits for it to be healthy. Runs before the boost so bundles download in parallel. |
 | `lib/boost.sh` | Installs SageAttention if asked, runs `lib/tune.py`, writes the chosen flags to `/workspace/.env`. |
 | `lib/sage.sh` | SageAttention install helpers: prebuilt wheel from this repo's releases, else source build. |
 | `lib/tune.py` | Benchmarks every attention backend on the GPU, checks accuracy, picks the fastest and the `--fast` features the GPU supports. Cached in `/workspace/.comfy_xtra/tune.json`. |
 | `lib/update.sh` | Update in place: swaps `/opt/comfy-xtra` for the latest `XTRA_REF` and restarts the dashboard. |
-| `comfyui_ext/` | The ComfyUI extension: proxies `/xtra/*` to the dashboard and adds the ⚡ Xtra tab and workflow-load check. |
+| `comfyui_ext/` | The ComfyUI extension: proxies `/xtra/*` to the dashboard and adds the Comfortable tab and workflow-load check. |
 | `dashboard/server.py` | Dashboard entry point (aiohttp, runs in ComfyUI's venv; binds 127.0.0.1:17890 behind the portal). |
 | `dashboard/xtra/` | Backend: `store` (SQLite + background MongoDB sync), `sources` (Civitai / Hugging Face), `downloads` (aria2 queue with resume + SHA-256 checks), `models`, `workflows`, `fixer` (model and node-pack resolution), `library`, `health`, `bench`, `autostop`, `backup`, `updater`, `system`, `gallery`, `api` / `api_more` (routes), `events` (SSE). |
 | `dashboard/ui/` | Web UI source: Vue 3 + Tailwind CSS 4 + reka-ui + Lucide, the same stack and design tokens as ComfyUI's frontend. |

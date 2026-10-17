@@ -243,7 +243,7 @@ class DownloadManager:
         origin = urllib.parse.urlparse(url).netloc
         cur = url
         timeout = aiohttp.ClientTimeout(total=30)
-        async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": "Comfy-Xtra/2"}) as s:
+        async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": "Comfortable/2"}) as s:
             for _ in range(8):
                 same = urllib.parse.urlparse(cur).netloc == origin
                 async with s.get(cur, headers=headers if same else {}, allow_redirects=False) as r:
@@ -265,7 +265,7 @@ class DownloadManager:
                "--auto-file-renaming=false", "--allow-overwrite=true", "--file-allocation=none",
                "--max-tries=5", "--retry-wait=3", "--connect-timeout=15", "--timeout=60",
                "--summary-interval=1", "--console-log-level=warn", "--download-result=hide",
-               "--user-agent=Comfy-Xtra/2", "--check-certificate=true"]
+               "--user-agent=Comfortable/2", "--check-certificate=true"]
         proc = await asyncio.create_subprocess_exec(*cmd, stdin=asyncio.subprocess.PIPE,
                                                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
         self.procs[task["id"]] = proc
@@ -311,7 +311,7 @@ class DownloadManager:
         start = part.stat().st_size if part.exists() else 0
         req_headers = dict(headers, **({"Range": f"bytes={start}-"} if start else {}))
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=60)
-        async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": "Comfy-Xtra/2"}) as s:
+        async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": "Comfortable/2"}) as s:
             async with s.get(url, headers=req_headers) as r:
                 if r.status in (401, 403):
                     raise PermissionError(denied_message(url))

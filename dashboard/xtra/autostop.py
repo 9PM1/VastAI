@@ -73,7 +73,7 @@ async def loop(store, downloads, interval=20):
                 _state["warned"] = True
                 bus.publish("autostop", status(store))
                 await notify.discord(store.setting("discord_webhook"), "⏸️ Instance idle",
-                                     f"Stopping in about {max(1, int(left // 60))} min unless something runs. Open Comfy-Xtra and press \"Keep running\" to postpone.",
+                                     f"Stopping in about {max(1, int(left // 60))} min unless something runs. Open Comfortable and press \"Keep running\" to postpone.",
                                      color=0xFD9903)
             if left <= 0 and not _state["stopping"]:
                 _state["stopping"] = True

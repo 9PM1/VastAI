@@ -1,4 +1,4 @@
-"""End-to-end test of the Comfy-Xtra API against a running server.
+"""End-to-end test of the Comfortable API against a running server.
 
 Usage: BASE=http://127.0.0.1:17891 python tests/api_test.py <XTRA_WORKSPACE of that server>
 Needs internet (Civitai and Hugging Face). Exits non-zero when a check fails.

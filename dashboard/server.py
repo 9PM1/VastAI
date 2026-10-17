@@ -1,4 +1,4 @@
-"""Comfy-Xtra dashboard server (aiohttp). Run: python dashboard/server.py"""
+"""Comfortable dashboard server (aiohttp). Run: python dashboard/server.py"""
 import asyncio
 import logging
 import os
@@ -87,7 +87,7 @@ async def on_startup(app):
     auto_install(app)
     st = app["store"]
     disk = (await system.snapshot())["disk"]
-    await notify.discord(st.setting("discord_webhook"), "🚀 Comfy-Xtra online",
+    await notify.discord(st.setting("discord_webhook"), "🚀 Comfortable online",
                          f"Dashboard v{__version__} is running on `{socket.gethostname()}`.", color=0x58A6FF,
                          fields=[{"name": "Database", "value": "MongoDB" if st.status()["mongo_connected"] else "Local only", "inline": True},
                                  {"name": "Disk free", "value": human_size(disk["free"]), "inline": True}])
@@ -126,7 +126,7 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
     host = os.environ.get("XTRA_HOST", "127.0.0.1")  # reached through the Instance Portal's Caddy proxy
-    log.info("Comfy-Xtra %s listening on %s:%d", __version__, host, config.PORT)
+    log.info("Comfortable %s listening on %s:%d", __version__, host, config.PORT)
     web.run_app(make_app(), host=host, port=config.PORT, access_log=None, print=None)
 
 
