@@ -27,7 +27,7 @@ XTRA_REPO="$XTRA_REPO" XTRA_REF="$XTRA_REF" bash "$XTRA_DIR/lib/version.sh" || t
 . "$XTRA_DIR/lib/common.sh"
 . "$XTRA_DIR/lib/extension.sh"
 new_ext_hash="$(cat "$XTRA_DIR"/comfyui_ext/*.py 2>/dev/null | sha256sum | cut -c1-16)"
-if [[ "$old_ext_hash" != "$new_ext_hash" ]]; then
+if [[ "$old_ext_hash" != "$new_ext_hash" && ! -f "$XTRA_DIR/.restart_comfy" ]]; then
   echo "comfyui extension python changed; ComfyUI restart needed" > "$XTRA_DIR/.restart_comfy"
 fi
 chmod 755 "$XTRA_DIR/supervisor/comfy-xtra.sh"

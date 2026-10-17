@@ -14,7 +14,7 @@ import requests
 from . import config
 from .util import new_id, now
 
-UA = {"User-Agent": "Comfy-Xtra/2"}
+UA = {"User-Agent": "Comfortable/2"}
 CIVITAI = "https://civitai.com/api/v1"
 TIMEOUT = 15
 

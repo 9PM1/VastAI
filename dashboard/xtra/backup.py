@@ -62,7 +62,7 @@ def run(store, reason="manual"):
         for start in range(0, len(ops), 200):
             chunk = ops[start:start + 200]
             api.create_commit(repo, operations=chunk, repo_type="dataset",
-                              commit_message=f"Comfy-Xtra backup ({reason}): {len(chunk)} file(s)")
+                              commit_message=f"Comfortable backup ({reason}): {len(chunk)} file(s)")
             for item in todo[start:start + 200]:
                 done[item["path"]] = f"{item['size']}:{item['mtime']}"
             MANIFEST.write_text(json.dumps(done))

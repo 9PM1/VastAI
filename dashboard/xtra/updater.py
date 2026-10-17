@@ -1,4 +1,4 @@
-"""Update Comfy-Xtra in place from GitHub, without renting a new instance.
+"""Update Comfortable in place from GitHub, without renting a new instance.
 
 provis.sh records the installed commit in /opt/comfy-xtra/VERSION. "Check"
 compares it with the latest commit of XTRA_REPO@XTRA_REF; "apply" runs
@@ -34,7 +34,7 @@ async def check(force=False):
     cur = installed()
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as s:
         async with s.get(f"https://api.github.com/repos/{REPO}/commits/{REF}",
-                         headers={"Accept": "application/vnd.github+json", "User-Agent": "Comfy-Xtra"}) as r:
+                         headers={"Accept": "application/vnd.github+json", "User-Agent": "Comfortable"}) as r:
             if r.status != 200:
                 raise RuntimeError(f"GitHub returned {r.status}")
             c = await r.json()

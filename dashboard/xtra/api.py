@@ -541,9 +541,9 @@ async def gallery_star(request):
 
 
 # ---- web UI ------------------------------------------------------------------------------------
-PLACEHOLDER = """<!doctype html><meta charset=utf-8><title>Comfy-Xtra</title>
+PLACEHOLDER = """<!doctype html><meta charset=utf-8><title>Comfortable</title>
 <body style="font:15px system-ui;background:#1a1a1a;color:#ddd;padding:40px">
-<h1>Comfy-Xtra API is running</h1><p>The web UI has not been built into <code>dashboard/web</code> yet.</p>
+<h1>Comfortable API is running</h1><p>The web UI has not been built into <code>dashboard/web</code> yet.</p>
 <p><a style="color:#8ab4f8" href="/api/bootstrap">/api/bootstrap</a></p>"""
 
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""xtra: rent and manage Comfy-Xtra instances on Vast.ai from your terminal (or from Claude).
+"""xtra: rent and manage Comfortable instances on Vast.ai from your terminal (or from Claude).
 
 Uses the `vastai` CLI (pip install vastai; `vastai set api-key ...`) and SSH (your key must be
-added at vast.ai/account). Talks to the Comfy-Xtra dashboard on the instance over SSH, so no
+added at vast.ai/account). Talks to the Comfortable dashboard on the instance over SSH, so no
 portal token is needed.
 
   xtra offers [--gpu RTX_4090,RTX_5090] [--max-price 0.8] [--min-vram 16] [--rank value|speed] [--for WORKFLOW]
@@ -174,7 +174,7 @@ def ssh(inst, command, timeout=60):
 
 
 def dash(inst, path, method="GET", body=None, timeout=60):
-    """Call the Comfy-Xtra API on the instance (through SSH, on 127.0.0.1:17890)."""
+    """Call the Comfortable API on the instance (through SSH, on 127.0.0.1:17890)."""
     data = ""
     if body is not None:
         payload = json.dumps(body).replace("'", "'\\''")
@@ -850,7 +850,7 @@ def cmd_needs(a):
 def cmd_tunnel(a):
     inst = pick_instance(a.id)
     host, port = ssh_target(inst)
-    print(f"Comfy-Xtra on http://localhost:{a.port}  (ComfyUI on http://localhost:{a.port + 1})  · Ctrl+C to close")
+    print(f"Comfortable on http://localhost:{a.port}  (ComfyUI on http://localhost:{a.port + 1})  · Ctrl+C to close")
     os.execvp("ssh", ["ssh", "-o", "LogLevel=ERROR", "-N", "-L", f"{a.port}:127.0.0.1:17890", "-L", f"{a.port + 1}:127.0.0.1:18188",
                       "-p", str(port), f"root@{host}"])
 
@@ -892,7 +892,7 @@ def cmd_fix(a):
     for n in plan["nodes"]:
         print(f"  node     {n['type']:<60} {(n['pack'] or {}).get('title') or 'no pack found'}{' (linked in the notes)' if n.get('via_notes') else ''}")
     if s["models_fixable"] or s["nodes_fixable"]:
-        print("Fix it from the ⚡ Xtra tab in ComfyUI, or the Fixer screen in Comfy-Xtra.")
+        print("Fix it from the Comfortable tab in ComfyUI, or the Fixer screen in Comfortable.")
 
 
 def cmd_simple(action):
@@ -969,7 +969,7 @@ def main():
     p.add_argument("workflow"); p.add_argument("id", nargs="?"); p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_fix)
     for action in ("stop", "start", "destroy"):
         p = sub.add_parser(action, help=f"{action} an instance"); p.add_argument("id"); p.set_defaults(fn=cmd_simple(action))
-    p = sub.add_parser("api", help="call any Comfy-Xtra API route on the instance, e.g. xtra api library")
+    p = sub.add_parser("api", help="call any Comfortable API route on the instance, e.g. xtra api library")
     p.add_argument("path"); p.add_argument("id", nargs="?"); p.add_argument("--method", "-X", default="GET")
     p.add_argument("--data", "-d", help="JSON body"); p.add_argument("--timeout", type=int, default=60); p.set_defaults(fn=cmd_api)
     p = sub.add_parser("logs", help="provisioning and dashboard logs")

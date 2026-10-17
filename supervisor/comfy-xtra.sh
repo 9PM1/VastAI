@@ -1,5 +1,5 @@
 #!/bin/bash
-# Supervisor launcher for the Comfy-Xtra dashboard (see comfy-xtra.conf).
+# Supervisor launcher for the Comfortable dashboard (see comfy-xtra.conf).
 XTRA_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 utils=/opt/supervisor-scripts/utils
 [[ -f "${utils}/environment.sh" ]] && . "${utils}/environment.sh"

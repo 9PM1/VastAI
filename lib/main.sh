@@ -10,9 +10,9 @@ export XTRA_DIR
 mkdir -p /workspace /var/log
 exec >>"$LOG_FILE" 2>&1
 
-log "Starting Comfy-Xtra provisioning (${XTRA_REF:-unknown ref})"
+log "Starting Comfortable provisioning (${XTRA_REF:-unknown ref})"
 log "Python: $PYTHON_BIN"
-send_discord "⚙️ Provisioning Started" "Comfy-Xtra setup started on \`$(hostname)\`." 3447003
+send_discord "⚙️ Provisioning Started" "Comfortable setup started on \`$(hostname)\`." 3447003
 
 bash "$XTRA_DIR/lib/version.sh" || true
 . "$XTRA_DIR/lib/setup.sh"
@@ -22,5 +22,5 @@ bash "$XTRA_DIR/lib/version.sh" || true
 . "$XTRA_DIR/lib/service.sh"
 . "$XTRA_DIR/lib/boost.sh"
 
-log "Comfy-Xtra ready on port ${DASH_PORT} (authentication disabled)"
-send_discord "🚀 Comfy-Xtra Online" "Dashboard passed health check on port \`${DASH_PORT}\`. Speed boost: ${BOOST_SUMMARY}." 2328118
+log "Comfortable ready on port ${DASH_PORT} (authentication disabled)"
+send_discord "🚀 Comfortable Online" "Dashboard passed health check on port \`${DASH_PORT}\`. Speed boost: ${BOOST_SUMMARY}." 2328118

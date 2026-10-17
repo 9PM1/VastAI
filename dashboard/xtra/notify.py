@@ -10,7 +10,7 @@ async def discord(webhook, title, description, color=0x238636, thumbnail=None, f
     if not webhook or not webhook.startswith("http"):
         return
     embed = {"title": title, "description": description, "color": color,
-             "footer": {"text": "Comfy-Xtra"}, "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+             "footer": {"text": "Comfortable"}, "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     if thumbnail:
         embed["thumbnail"] = {"url": thumbnail}
     if fields:

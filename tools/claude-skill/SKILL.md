@@ -1,9 +1,9 @@
 ---
-name: comfy-xtra
-description: Rent, check, tunnel into, fix workflows on, stop and destroy Vast.ai GPU instances running the "ComfyUI - With XTra" template (Comfy-Xtra dashboard). Use when the user wants to rent a GPU for ComfyUI, asks what their Vast instance is doing, wants the dashboard locally, wants a workflow checked for missing models/nodes, wants to keep models between instances, or compares GPU value.
+name: comfortable
+description: Rent, check, tunnel into, fix workflows on, stop and destroy Vast.ai GPU instances running the user's Comfortable template (formerly Comfy-Xtra; Vast template "ComfyUI - With XTra amd Speed Boost6", id 733467). Use when the user wants to rent a GPU for ComfyUI, asks what their Vast instance is doing, wants the dashboard locally, wants a workflow checked for missing models/nodes, wants to keep models between instances, or compares GPU value.
 ---
 
-# Comfy-Xtra on Vast.ai
+# Comfortable on Vast.ai (formerly Comfy-Xtra)
 
 All actions go through `xtra.py` in this skill's folder (a copy of `tools/xtra.py` from the 9PM1/VastAI repo).
 Run it with the Python that has the `vastai` package installed (`pip install vastai`; the API key is set
@@ -89,9 +89,9 @@ faster hosts at $1-4/TB were available. Hence rules 2-4 and the `--offer` flag.
   The first rental of a GPU model the user hasn't benchmarked runs the 2-minute benchmark automatically
   (`--no-bench` to skip), so later rankings use real numbers.
 - **Missing models or nodes.** `fix` shows what's missing, what's optional (switched-off nodes) and where each
-  file would come from. The fix itself runs inside ComfyUI (⚡ Xtra tab) or by posting the `models` entries
+  file would come from. The fix itself runs inside ComfyUI (Comfortable tab) or by posting the `models` entries
   (each carries its `fix`) and the pack ids from `fix --json` to
-  `api fix/apply -X POST -d '{"models": [...], "packs": [...]}'`. Prefer pointing the user to the ⚡ Xtra
+  `api fix/apply -X POST -d '{"models": [...], "packs": [...]}'`. Prefer pointing the user to the Comfortable
   tab: it shows sizes and asks before installing node packs. When testing, don't download big models (tens of
   GB) unless the user asked: use small files to check paths.
 - **Keep models between instances.** `rent --keep-models` creates (first time) or links (afterwards) a Vast

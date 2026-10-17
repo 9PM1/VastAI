@@ -1,11 +1,12 @@
 <script setup>
 import { computed, defineAsyncComponent, onMounted } from 'vue'
 import { onKeyStroke } from '@vueuse/core'
-import { BookMarked, Compass, Wand2, Download, Images, Activity, Settings, Zap, WifiOff, CircleAlert, Clock, ArrowUpCircle } from '@lucide/vue'
+import { BookMarked, Compass, Wand2, Download, Images, Activity, Settings, WifiOff, CircleAlert, Clock, ArrowUpCircle } from '@lucide/vue'
 import { api } from './lib/api'
 import { useApp } from './stores/app'
 import { route, go } from './lib/route'
 import { embedded } from './lib/bridge'
+import logoUrl from './assets/logo.png'
 import StatusBar from './components/StatusBar.vue'
 import ViewState from './components/ViewState.vue'
 import CommandPalette from './components/CommandPalette.vue'
@@ -44,8 +45,8 @@ const snooze = () => api.post('autostop/snooze').then((s) => (app.autostop = s))
   <div class="flex h-full" :class="embedded && 'embedded'">
     <!-- Desktop sidebar, styled like ComfyUI's side toolbar -->
     <nav v-if="!embedded" class="hidden w-[72px] shrink-0 flex-col items-center gap-1 border-r border-stroke bg-panel py-3 md:flex" aria-label="Main">
-      <button class="mb-3 flex size-9 items-center justify-center rounded-lg bg-primary-soft" title="Comfy-Xtra · Ctrl+K for commands" @click="app.paletteOpen = true">
-        <Zap class="size-5 text-primary-hover" />
+      <button class="mb-3 flex size-11 items-center justify-center rounded-lg transition-transform hover:scale-105" title="Comfortable · Ctrl+K for commands" aria-label="Comfortable: open the command palette" @click="app.paletteOpen = true">
+        <img :src="logoUrl" alt="" class="size-11 object-contain" />
       </button>
       <a
         v-for="n in nav" :key="n.id" :href="`#/${n.id}`"
@@ -72,7 +73,7 @@ const snooze = () => api.post('autostop/snooze').then((s) => (app.autostop = s))
       <!-- Update available -->
       <div v-else-if="app.update?.available && route.view !== 'settings'" class="flex items-center gap-2 border-b border-stroke bg-primary-soft px-4 py-1.5 text-xs">
         <ArrowUpCircle class="size-4 text-primary-hover" />
-        <span class="min-w-0 flex-1 truncate">Comfy-Xtra update available: {{ app.update.latest?.message }}</span>
+        <span class="min-w-0 flex-1 truncate">Comfortable update available: {{ app.update.latest?.message }}</span>
         <Btn size="sm" variant="link" @click="go('settings', { section: 'update' })">Review</Btn>
       </div>
       <div v-if="!app.connected && app.ready" class="flex items-center gap-2 border-b border-stroke bg-[color-mix(in_srgb,var(--warning)_12%,transparent)] px-4 py-1.5 text-xs text-warn">
@@ -83,7 +84,7 @@ const snooze = () => api.post('autostop/snooze').then((s) => (app.autostop = s))
           <div class="flex items-start gap-3 rounded-xl border border-subtle bg-panel p-5">
             <CircleAlert class="mt-0.5 size-5 shrink-0 text-danger-hover" />
             <div>
-              <p class="font-medium">Can't reach the Comfy-Xtra backend</p>
+              <p class="font-medium">Can't reach the Comfortable backend</p>
               <p class="mt-1 text-sm text-fg2">{{ app.bootError }}</p>
             </div>
           </div>

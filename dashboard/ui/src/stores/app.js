@@ -89,7 +89,7 @@ export const useApp = defineStore('app', {
       on('benchmark', (b) => { this.bench = b })
       on('backup', (b) => { this.backup = { ...(this.backup || {}), ...b } })
       on('autostop', (a) => {
-        if (a.warned && !this.autostop?.warned) notify('Instance idle', 'It will stop soon to save money. Open Comfy-Xtra to keep it running.')
+        if (a.warned && !this.autostop?.warned) notify('Instance idle', 'It will stop soon to save money. Open Comfortable to keep it running.')
         this.autostop = { ...(this.autostop || {}), ...a }
       })
       on('data', (d) => {

@@ -61,7 +61,7 @@ async function applyUpdate() {
   updating.value = true
   try {
     await api.post('update/apply')
-    app.toast('Updating Comfy-Xtra… the dashboard restarts and reloads by itself', 'info')
+    app.toast('Updating Comfortable… the dashboard restarts and reloads by itself', 'info')
     // Wait for the new version to come up, then reload.
     const before = app.update?.installed
     for (let i = 0; i < 60; i++) {
@@ -214,7 +214,7 @@ onMounted(async () => { await nextTick(); document.getElementById(`s-${route.val
     </section>
 
     <section class="flex flex-wrap items-center gap-x-4 gap-y-1 px-1 text-xs text-muted">
-      <span class="flex items-center gap-1"><Info class="size-3.5" /> Comfy-Xtra {{ app.boot.version }} · {{ short(app.boot.installed?.sha) }}</span>
+      <span class="flex items-center gap-1"><Info class="size-3.5" /> Comfortable {{ app.boot.version }} · {{ short(app.boot.installed?.sha) }}</span>
       <span>Download engine: {{ app.boot.engine }}</span>
       <span class="flex items-center gap-1"><kbd class="rounded border border-subtle px-1">Ctrl</kbd>+<kbd class="rounded border border-subtle px-1">K</kbd> commands</span>
       <a href="https://github.com/9PM1/VastAI" target="_blank" rel="noopener" class="flex items-center gap-1 hover:text-fg">Source <ExternalLink class="size-3" /></a>
