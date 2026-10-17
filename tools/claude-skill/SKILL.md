@@ -1,6 +1,6 @@
 ---
 name: comfortable
-description: Rent, check, tunnel into, fix workflows on, stop and destroy Vast.ai GPU instances running the user's Comfortable template (formerly Comfy-Xtra; Vast template "ComfyUI - With XTra amd Speed Boost6", id 733467). Use when the user wants to rent a GPU for ComfyUI, asks what their Vast instance is doing, wants the dashboard locally, wants a workflow checked for missing models/nodes, wants to keep models between instances, or compares GPU value.
+description: Rent, check, tunnel into, fix workflows on, stop and destroy Vast.ai GPU instances running the user's Comfortable template (formerly Comfy-Xtra; Vast template "Comfortable", id 733467). Use when the user wants to rent a GPU for ComfyUI, asks what their Vast instance is doing, wants the dashboard locally, wants a workflow checked for missing models/nodes, wants to keep models between instances, or compares GPU value.
 ---
 
 # Comfortable on Vast.ai (formerly Comfy-Xtra)
